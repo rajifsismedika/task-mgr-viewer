@@ -1,0 +1,28 @@
+{
+  "name": "task-viewer",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev:frontend": "vite --port 5176",
+    "dev:proxy": "bun proxy.js",
+    "dev": "run-p dev:frontend dev:proxy",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "http-proxy-middleware": "^4.2.0",
+    "vue": "^3.5.38"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.7",
+    "npm-run-all": "^4.1.5",
+    "vite": "^8.0.16",
+    "vite-plugin-vue-devtools": "^8.1.2"
+  },
+  "engines": {
+    "node": "^22.18.0 || >=24.12.0"
+  }
+}

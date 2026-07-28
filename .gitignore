@@ -1,0 +1,5 @@
+task-viewer/node_modules/
+task-viewer/dist/
+task-viewer/data/
+task-viewer/.DS_Store
+.DS_Store

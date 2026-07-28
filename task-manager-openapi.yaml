@@ -1,0 +1,1716 @@
+openapi: 3.0.3
+info:
+  title: TaskMgr Routine API
+  version: "1.0.0"
+  description: Curated machine-to-machine endpoints mounted under /api/v1, with a few legacy routine-only endpoints still under /api/v1/claude/routines.
+servers:
+  - url: /
+security:
+  - bearerAuth: []
+tags:
+  - name: Auth API
+  - name: Task API
+  - name: Search API
+  - name: Master API
+  - name: Routine API
+  - name: Code Docs
+  - name: Analytics API
+paths:
+  /api/v1/auth/login:
+    post:
+      tags: [Auth API]
+      summary: Authenticate with username and password
+      description: >-
+        Also the ONLY entry point for machine "rest-client" integration
+        accounts (user.role == "rest-client", created via
+        /admin/api-clients): those accounts are blocked from the web login
+        UI entirely and authenticate here exclusively. Their JWT uses a
+        longer, separately configured TTL (REST_CLIENT_TOKEN_TTL_SECONDS,
+        default 7 days) than a human login, and `permissions` in the
+        response is all-false (no task-lifecycle role/permission is ever
+        granted to a rest-client account).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AuthLoginRequest'}
+      responses:
+        '200': {description: Login success, content: {application/json: {schema: {$ref: '#/components/schemas/AuthLoginResponse'}}}}
+        '400': {description: Invalid payload, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '401': {description: Invalid credentials, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '503': {description: Auth service unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  /api/v1/auth/logout:
+    post:
+      tags: [Auth API]
+      summary: Revoke the current JWT
+      security:
+        - jwtBearerAuth: []
+      responses:
+        '204': {description: Logged out}
+        '401': {description: Unauthorized, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '503': {description: Auth service unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  /api/v1/auth/me:
+    get:
+      tags: [Auth API]
+      summary: Get the current authenticated user
+      security:
+        - jwtBearerAuth: []
+      responses:
+        '200': {description: Current user, content: {application/json: {schema: {$ref: '#/components/schemas/AuthMeResponse'}}}}
+        '401': {description: Unauthorized, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  /api/v1/auth/impersonate:
+    post:
+      tags: [Auth API]
+      summary: Admin-only — mint a JWT for another user
+      description: >-
+        Lets an authenticated Admin obtain a normal login-shaped JWT for
+        another ACTIVE user, without that user's password. Mirrors the web
+        "Login as user" impersonation flow but returns a bearer token instead
+        of swapping the session cookie. Admin-only, enforced in-handler (the
+        route itself only requires any valid bearer token).
+      security:
+        - jwtBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AuthImpersonateRequest'}
+      responses:
+        '200': {description: Impersonation token issued, content: {application/json: {schema: {$ref: '#/components/schemas/AuthLoginResponse'}}}}
+        '400': {description: Invalid payload, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '401': {description: Unauthorized, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Admin role required, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Target user not found or inactive, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '503': {description: Auth service unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  /api/v1/tasks:
+    get:
+      tags: [Task API]
+      security:
+        - jwtBearerAuth: []
+      summary: List tasks
+      parameters:
+        - name: status
+          in: query
+          schema: {type: string}
+        - name: product
+          in: query
+          schema: {type: string}
+        - name: module
+          in: query
+          schema: {type: string}
+        - name: type
+          in: query
+          schema: {type: string}
+        - name: severity
+          in: query
+          schema: {type: string}
+        - name: priority
+          in: query
+          schema: {type: string}
+        - name: complexity
+          in: query
+          schema: {type: string}
+        - name: tag
+          in: query
+          schema: {type: string}
+        - name: stage
+          in: query
+          schema: {type: string, enum: [dev, qa, qc]}
+        - name: assigneeUserID
+          in: query
+          schema: {type: string}
+        - name: onHold
+          in: query
+          schema: {type: string, enum: [only, exclude]}
+        - name: includeArchived
+          in: query
+          schema: {type: boolean, default: false}
+        - name: search
+          in: query
+          description: >
+            Free-text keyword search across task code, title/description
+            substring, attachment filename, jam.dev/evidence link, and
+            semantic/fulltext relevance — same multi-modal resolution as the
+            web-UI keyword box. `keyword` and `q` are accepted as aliases.
+          schema: {type: string}
+        - name: page
+          in: query
+          schema: {type: integer, default: 1}
+        - name: pageSize
+          in: query
+          schema: {type: integer, default: 10}
+      responses:
+        '200': {description: Paginated task list, content: {application/json: {schema: {$ref: '#/components/schemas/TaskListResponse'}}}}
+    post:
+      tags: [Task API]
+      security:
+        - jwtBearerAuth: []
+      summary: Create task
+      description: >
+        Creates a top-level task or a sub-task. A request becomes a sub-task when
+        `parentTaskID` is non-empty. File attachments are intentionally not part
+        of this JSON contract.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskCreateRequest'}}}
+      responses:
+        '201': {description: Created task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Malformed JSON or unknown fields, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '401': {description: Unauthorized, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+        '500': {description: Repository or master-data failure, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  /api/v1/latest-tasks:
+    get:
+      tags: [Task API]
+      security:
+        - jwtBearerAuth: []
+      summary: List tasks updated within a window
+      description: >
+        Clone of GET /api/v1/tasks — same filters, same response shape — plus an
+        updatedAfter/updatedBefore window so a client can pull only the latest
+        data instead of re-fetching the whole list. Both bounds are optional and
+        accept a bare date, a local datetime, or a full RFC3339 timestamp, all
+        interpreted in the server's configured app timezone (APP_TIMEZONE,
+        default Asia/Jakarta = UTC+7). A bare date as updatedAfter means
+        00:00:00 that day; as updatedBefore it means 23:59:59 that day.
+      parameters:
+        - name: status
+          in: query
+          schema: {type: string}
+        - name: product
+          in: query
+          schema: {type: string}
+        - name: module
+          in: query
+          schema: {type: string}
+        - name: type
+          in: query
+          schema: {type: string}
+        - name: severity
+          in: query
+          schema: {type: string}
+        - name: priority
+          in: query
+          schema: {type: string}
+        - name: complexity
+          in: query
+          schema: {type: string}
+        - name: tag
+          in: query
+          schema: {type: string}
+        - name: stage
+          in: query
+          schema: {type: string, enum: [dev, qa, qc]}
+        - name: assigneeUserID
+          in: query
+          schema: {type: string}
+        - name: onHold
+          in: query
+          schema: {type: string, enum: [only, exclude]}
+        - name: includeArchived
+          in: query
+          schema: {type: boolean, default: false}
+        - name: updatedAfter
+          in: query
+          description: >
+            Only include tasks updated at/after this moment. Accepts YYYY-MM-DD,
+            YYYY-MM-DDTHH:MM:SS (app timezone), or RFC3339.
+          schema: {type: string}
+          examples:
+            date: {value: '2026-07-13'}
+            rfc3339: {value: '2026-07-13T09:30:00+07:00'}
+        - name: updatedBefore
+          in: query
+          description: >
+            Only include tasks updated at/before this moment. Accepts YYYY-MM-DD,
+            YYYY-MM-DDTHH:MM:SS (app timezone), or RFC3339.
+          schema: {type: string}
+          examples:
+            date: {value: '2026-07-13'}
+            rfc3339: {value: '2026-07-13T09:30:00+07:00'}
+        - name: page
+          in: query
+          schema: {type: integer, default: 1}
+        - name: pageSize
+          in: query
+          schema: {type: integer, default: 10}
+      responses:
+        '200': {description: Paginated task list, content: {application/json: {schema: {$ref: '#/components/schemas/TaskListResponse'}}}}
+        '400': {description: Invalid updatedAfter/updatedBefore format, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  /api/v1/tasks/{id}:
+    get:
+      tags: [Task API]
+      security:
+        - jwtBearerAuth: []
+      summary: Get task
+      parameters:
+        - $ref: '#/components/parameters/TaskID'
+      responses:
+        '200': {description: OK acknowledgement, content: {application/json: {schema: {$ref: '#/components/schemas/OKResponse'}}}}
+    patch:
+      tags: [Task API]
+      security:
+        - jwtBearerAuth: []
+      summary: Update task metadata
+      description: >
+        Updates the same task metadata edited by the quick-edit flow. Omitted
+        fields are left unchanged. On sub-tasks, `branchSource` is ignored and
+        inherited from the parent task. File attachments are not supported here.
+      parameters:
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskPatchRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Malformed JSON or unknown fields, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '401': {description: Unauthorized, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Task is in a conflicting state, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+        '500': {description: Repository or master-data failure, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  /api/v1/tasks/{id}/take:
+    post:
+      tags: [Task API]
+      security:
+        - jwtBearerAuth: []
+      summary: Claim a reported task
+      parameters:
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineActorRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Claim conflict, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+  /api/v1/tasks/{id}/dev-done:
+    post:
+      tags: [Task API]
+      security:
+        - jwtBearerAuth: []
+      summary: Mark development done
+      parameters:
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineActorRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Task is in a conflicting state, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+  /api/v1/tasks/{id}/qa-start:
+    post:
+      tags: [Task API]
+      security:
+        - jwtBearerAuth: []
+      summary: Start QA review
+      parameters:
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineActorRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Claim conflict, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+  /api/v1/tasks/{id}/qa-approve:
+    post:
+      tags: [Task API]
+      security:
+        - jwtBearerAuth: []
+      summary: Approve QA review
+      parameters:
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineActorRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Task is in a conflicting state, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+  /api/v1/tasks/{id}/qa-reject:
+    post:
+      tags: [Task API]
+      security:
+        - jwtBearerAuth: []
+      summary: Reject QA review
+      parameters:
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineRejectRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Task is in a conflicting state, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+  /api/v1/tasks/{id}/qc-start:
+    post:
+      tags: [Task API]
+      security:
+        - jwtBearerAuth: []
+      summary: Start QC review
+      parameters:
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineActorRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Claim conflict, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+  /api/v1/tasks/{id}/qc-approve:
+    post:
+      tags: [Task API]
+      security:
+        - jwtBearerAuth: []
+      summary: Approve QC review
+      parameters:
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineActorRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Task is in a conflicting state, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+  /api/v1/tasks/{id}/qc-reject:
+    post:
+      tags: [Task API]
+      security:
+        - jwtBearerAuth: []
+      summary: Reject QC review
+      parameters:
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineRejectRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Task is in a conflicting state, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+  /api/v1/tasks/{id}/hold:
+    post:
+      tags: [Task API]
+      security:
+        - jwtBearerAuth: []
+      summary: Put a task on hold
+      parameters:
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineHoldRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Task is in a conflicting state, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+  /api/v1/tasks/{id}/hold/lift:
+    post:
+      tags: [Task API]
+      security:
+        - jwtBearerAuth: []
+      summary: Lift a task hold
+      parameters:
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineActorRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Task is in a conflicting state, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+  /api/v1/tasks/{id}/assignments:
+    post:
+      tags: [Task API]
+      security:
+        - jwtBearerAuth: []
+      summary: Update task assignment
+      parameters:
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineAssignmentRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found or unsupported state, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Task is in a conflicting state, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+  /api/v1/tasks/{id}/status:
+    post:
+      tags: [Task API]
+      security:
+        - jwtBearerAuth: []
+      summary: Set task status
+      parameters:
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: false
+        content: {application/json: {schema: {$ref: '#/components/schemas/TaskStatusRequest'}}}
+      responses:
+        '200': {description: OK acknowledgement, content: {application/json: {schema: {$ref: '#/components/schemas/OKResponse'}}}}
+  /api/v1/tasks/{id}/notes:
+    post:
+      tags: [Task API]
+      security:
+        - jwtBearerAuth: []
+      summary: Add task note
+      parameters:
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/TaskNoteRequest'}}}
+      responses:
+        '200': {description: OK acknowledgement, content: {application/json: {schema: {$ref: '#/components/schemas/OKResponse'}}}}
+  /api/v1/tasks/{id}/discussion:
+    get:
+      tags: [Task API]
+      security:
+        - jwtBearerAuth: []
+      summary: Get task discussion thread
+      description: >
+        Full discussion thread (messages + per-mention WhatsApp notification
+        outcome) for a task, newest-first up to `limit`. 503 when the
+        discussion backend is not wired.
+      parameters:
+        - $ref: '#/components/parameters/TaskID'
+        - name: limit
+          in: query
+          description: Max messages returned (1-100). Values outside that range fall back to 100.
+          schema: {type: integer, default: 100}
+      responses:
+        '200': {description: Discussion thread, content: {application/json: {schema: {$ref: '#/components/schemas/TaskDiscussionListResponse'}}}}
+        '404': {description: Task not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '503': {description: Discussion backend not available, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  /api/v1/master/products:
+    get:
+      tags: [Master API]
+      security:
+        - jwtBearerAuth: []
+      summary: List products
+      responses:
+        '200': {description: Product list, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/MasterProduct'}}}}}
+  /api/v1/master/modules:
+    get:
+      tags: [Master API]
+      security:
+        - jwtBearerAuth: []
+      summary: List modules
+      responses:
+        '200': {description: Module list, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/MasterModule'}}}}}
+    post:
+      tags: [Master API]
+      security:
+        - jwtBearerAuth: []
+      summary: Create module
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/CreateModuleRequest'}}}
+      responses:
+        '201': {description: Created module, content: {application/json: {schema: {$ref: '#/components/schemas/MasterModule'}}}}
+        '400': {description: Malformed JSON, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '401': {description: Unauthorized, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Code already exists, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  /api/v1/master/modules/{code}:
+    get:
+      tags: [Master API]
+      security:
+        - jwtBearerAuth: []
+      summary: Get module by code
+      parameters:
+        - {name: code, in: path, required: true, schema: {type: string}}
+      responses:
+        '200': {description: Module, content: {application/json: {schema: {$ref: '#/components/schemas/MasterModule'}}}}
+        '404': {description: Not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    patch:
+      tags: [Master API]
+      security:
+        - jwtBearerAuth: []
+      summary: Update module
+      parameters:
+        - {name: code, in: path, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/UpdateModuleRequest'}}}
+      responses:
+        '200': {description: Updated module, content: {application/json: {schema: {$ref: '#/components/schemas/MasterModule'}}}}
+        '400': {description: Malformed JSON, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '401': {description: Unauthorized, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+    delete:
+      tags: [Master API]
+      security:
+        - jwtBearerAuth: []
+      summary: Delete module
+      parameters:
+        - {name: code, in: path, required: true, schema: {type: string}}
+      responses:
+        '204': {description: Deleted}
+        '401': {description: Unauthorized, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Module in use, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  /api/v1/master/modules/{code}/code:
+    patch:
+      tags: [Master API]
+      security:
+        - jwtBearerAuth: []
+      summary: Rename module code
+      parameters:
+        - {name: code, in: path, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RenameModuleCodeRequest'}}}
+      responses:
+        '200': {description: Rename result, content: {application/json: {schema: {$ref: '#/components/schemas/OKResponse'}}}}
+        '401': {description: Unauthorized, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Code conflict or not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  /api/v1/master/modules/{code}/toggle-active:
+    post:
+      tags: [Master API]
+      security:
+        - jwtBearerAuth: []
+      summary: Toggle module active flag
+      parameters:
+        - {name: code, in: path, required: true, schema: {type: string}}
+      responses:
+        '200': {description: New active state, content: {application/json: {schema: {$ref: '#/components/schemas/OKResponse'}}}}
+        '401': {description: Unauthorized, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  /api/v1/master/clients:
+    get:
+      tags: [Master API]
+      security:
+        - jwtBearerAuth: []
+      summary: List clients
+      responses:
+        '200': {description: Client list, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/MasterClient'}}}}}
+  /api/v1/master/outsource-teams:
+    get:
+      tags: [Master API]
+      security:
+        - jwtBearerAuth: []
+      summary: List outsource teams
+      responses:
+        '200': {description: Outsource team list, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/MasterOutsourceTeam'}}}}}
+  /api/v1/claude/routines/tasks:
+    get:
+      tags: [Routine API]
+      summary: List tasks
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XNonce'
+        - $ref: '#/components/parameters/XSignature'
+        - name: status
+          in: query
+          schema: {type: string}
+      responses:
+        '200': {description: OK acknowledgement, content: {application/json: {schema: {$ref: '#/components/schemas/OKResponse'}}}}
+    post:
+      tags: [Routine API]
+      summary: Create task
+      description: >
+        Creates a top-level task or a sub-task. A request becomes a sub-task when
+        `parentTaskID` is non-empty. File attachments are intentionally not part
+        of this JSON contract.
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XNonce'
+        - $ref: '#/components/parameters/XSignature'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskCreateRequest'}}}
+      responses:
+        '201': {description: Created task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Malformed JSON or unknown fields, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '401': {description: Unauthorized, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+        '500': {description: Repository or master-data failure, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  /api/v1/claude/routines/tasks/{id}:
+    get:
+      tags: [Routine API]
+      summary: Get task
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XNonce'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/TaskID'
+      responses:
+        '200': {description: OK acknowledgement, content: {application/json: {schema: {$ref: '#/components/schemas/OKResponse'}}}}
+    patch:
+      tags: [Routine API]
+      summary: Update task metadata
+      description: >
+        Updates the same task metadata edited by the quick-edit flow. Omitted
+        fields are left unchanged. On sub-tasks, `branchSource` is ignored and
+        inherited from the parent task. File attachments are not supported here.
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XNonce'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskPatchRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Malformed JSON or unknown fields, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '401': {description: Unauthorized, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Task is in a conflicting state, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+        '500': {description: Repository or master-data failure, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  /api/v1/claude/routines/tasks/{id}/take:
+    post:
+      tags: [Routine API]
+      summary: Claim a reported task
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XNonce'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineActorRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Claim conflict, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+  /api/v1/claude/routines/tasks/{id}/dev-done:
+    post:
+      tags: [Routine API]
+      summary: Mark development done
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XNonce'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineActorRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Task is in a conflicting state, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+  /api/v1/claude/routines/tasks/{id}/qa-start:
+    post:
+      tags: [Routine API]
+      summary: Start QA review
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XNonce'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineActorRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Claim conflict, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+  /api/v1/claude/routines/tasks/{id}/qa-approve:
+    post:
+      tags: [Routine API]
+      summary: Approve QA review
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XNonce'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineActorRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Task is in a conflicting state, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+  /api/v1/claude/routines/tasks/{id}/qa-reject:
+    post:
+      tags: [Routine API]
+      summary: Reject QA review
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XNonce'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineRejectRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Task is in a conflicting state, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+  /api/v1/claude/routines/tasks/{id}/qc-start:
+    post:
+      tags: [Routine API]
+      summary: Start QC review
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XNonce'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineActorRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Claim conflict, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+  /api/v1/claude/routines/tasks/{id}/qc-approve:
+    post:
+      tags: [Routine API]
+      summary: Approve QC review
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XNonce'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineActorRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Task is in a conflicting state, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+  /api/v1/claude/routines/tasks/{id}/qc-reject:
+    post:
+      tags: [Routine API]
+      summary: Reject QC review
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XNonce'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineRejectRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Task is in a conflicting state, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+  /api/v1/claude/routines/tasks/{id}/hold:
+    post:
+      tags: [Routine API]
+      summary: Put a task on hold
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XNonce'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineHoldRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Task is in a conflicting state, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+  /api/v1/claude/routines/tasks/{id}/hold/lift:
+    post:
+      tags: [Routine API]
+      summary: Lift a task hold
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XNonce'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineActorRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Task is in a conflicting state, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+  /api/v1/claude/routines/tasks/{id}/assignments:
+    post:
+      tags: [Routine API]
+      summary: Update task assignment
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XNonce'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RoutineAssignmentRequest'}}}
+      responses:
+        '200': {description: Updated task summary, content: {application/json: {schema: {$ref: '#/components/schemas/RoutineTaskResponse'}}}}
+        '400': {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Task not found or unsupported state, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '409': {description: Task is in a conflicting state, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '422': {description: Validation failed, content: {application/json: {schema: {$ref: '#/components/schemas/ValidationErrorResponse'}}}}
+  /api/v1/claude/routines/tasks/{id}/status:
+    post:
+      tags: [Routine API]
+      summary: Set task status
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XNonce'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: false
+        content: {application/json: {schema: {$ref: '#/components/schemas/TaskStatusRequest'}}}
+      responses:
+        '200': {description: OK acknowledgement, content: {application/json: {schema: {$ref: '#/components/schemas/OKResponse'}}}}
+  /api/v1/claude/routines/tasks/{id}/notes:
+    post:
+      tags: [Routine API]
+      summary: Add task note
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XNonce'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/TaskID'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/TaskNoteRequest'}}}
+      responses:
+        '200': {description: OK acknowledgement, content: {application/json: {schema: {$ref: '#/components/schemas/OKResponse'}}}}
+  /api/v1/claude/routines/worklog/sync:
+    post:
+      tags: [Routine API]
+      summary: Sync worklog summaries
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XNonce'
+        - $ref: '#/components/parameters/XSignature'
+        - name: window
+          in: query
+          description: Comma-separated or repeated logical windows.
+          schema: {type: string}
+      responses:
+        '200': {description: Sync result, content: {application/json: {schema: {$ref: '#/components/schemas/WorklogSyncResponse'}}}}
+  /api/v1/claude/routines/weekly-target/sync:
+    post:
+      tags: [Routine API]
+      summary: Sync weekly target sheet
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XNonce'
+        - $ref: '#/components/parameters/XSignature'
+        - name: week
+          in: query
+          description: ISO week in YYYY-Www format.
+          schema: {type: string}
+      responses:
+        '200': {description: Sync result, content: {application/json: {schema: {$ref: '#/components/schemas/WeeklyTargetSyncResponse'}}}}
+  /api/v1/claude/routines/chats/ingest:
+    post:
+      tags: [Routine API]
+      summary: Ingest chat window
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XNonce'
+        - $ref: '#/components/parameters/XSignature'
+      requestBody:
+        required: false
+        content: {application/json: {schema: {$ref: '#/components/schemas/ChatIngestRequest'}}}
+      responses:
+        '200': {description: Script JSON payload, content: {application/json: {schema: {$ref: '#/components/schemas/ArbitraryObject'}}}}
+        '502': {description: Upstream script failure, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  /api/v1/search/tasks:
+    get:
+      tags: [Search API]
+      security:
+        - jwtBearerAuth: []
+      summary: Search similar tasks for a chat thread
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: {type: string}
+        - name: productCode
+          in: query
+          schema: {type: string}
+      responses:
+        '200': {description: Match candidates, content: {application/json: {schema: {$ref: '#/components/schemas/SearchTasksResponse'}}}}
+  /api/v1/search/jam-check:
+    get:
+      tags: [Search API]
+      security:
+        - jwtBearerAuth: []
+      summary: Find tasks already linked to jam.dev URLs
+      parameters:
+        - name: jamURLs
+          in: query
+          description: Repeat the parameter; comma-separated values are also accepted.
+          schema: {type: array, items: {type: string}}
+          style: form
+          explode: true
+      responses:
+        '200': {description: Existing jam matches, content: {application/json: {schema: {$ref: '#/components/schemas/JamCheckResponse'}}}}
+  /api/v1/claude/routines/chats/search-tasks:
+    get:
+      tags: [Routine API]
+      security: []
+      summary: Search similar tasks for a chat thread
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XNonce'
+        - $ref: '#/components/parameters/XSignature'
+        - name: q
+          in: query
+          required: true
+          schema: {type: string}
+        - name: productCode
+          in: query
+          schema: {type: string}
+      responses:
+        '200': {description: Match candidates, content: {application/json: {schema: {$ref: '#/components/schemas/SearchTasksResponse'}}}}
+  /api/v1/claude/routines/chats/jam-check:
+    get:
+      tags: [Routine API]
+      security: []
+      summary: Find tasks already linked to jam.dev URLs
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XNonce'
+        - $ref: '#/components/parameters/XSignature'
+        - name: jamURLs
+          in: query
+          description: Repeat the parameter; comma-separated values are also accepted.
+          schema: {type: array, items: {type: string}}
+          style: form
+          explode: true
+      responses:
+        '200': {description: Existing jam matches, content: {application/json: {schema: {$ref: '#/components/schemas/JamCheckResponse'}}}}
+  /api/v1/claude/routines/chats/summary:
+    post:
+      tags: [Routine API]
+      summary: Upsert a chat-summary thread
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XNonce'
+        - $ref: '#/components/parameters/XSignature'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ChatSummaryRecord'}}}
+      responses:
+        '200': {description: Upsert result, content: {application/json: {schema: {$ref: '#/components/schemas/CreateSummaryResponse'}}}}
+        '400': {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '500': {description: Persist failure, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  /api/v1/code-docs/search:
+    get:
+      tags: [Code Docs]
+      security:
+        - jwtBearerAuth: []
+      summary: Semantic search over the code-docs component styleguide
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: {type: string}
+          description: Search text (required)
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 20, default: 5}
+          description: Max results to return (default 5, capped at 20)
+      responses:
+        '200': {description: Search results, content: {application/json: {schema: {$ref: '#/components/schemas/CodeDocSearchResponse'}}}}
+        '400': {description: Missing q parameter, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '401': {description: Unauthorized, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '503': {description: Code-docs API unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  /api/v1/code-docs/components:
+    get:
+      tags: [Code Docs]
+      security:
+        - jwtBearerAuth: []
+      summary: List all indexed code-docs components
+      responses:
+        '200': {description: Component list, content: {application/json: {schema: {$ref: '#/components/schemas/CodeDocComponentsResponse'}}}}
+        '401': {description: Unauthorized, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '503': {description: Code-docs API unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  /api/v1/code-docs/components/{slug}:
+    get:
+      tags: [Code Docs]
+      security:
+        - jwtBearerAuth: []
+      summary: Get a single component by slug
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema: {type: string}
+          description: Component slug, e.g. buttons, modals-confirmations
+      responses:
+        '200': {description: Component detail, content: {application/json: {schema: {$ref: '#/components/schemas/CodeDocComponent'}}}}
+        '401': {description: Unauthorized, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '404': {description: Unknown slug, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '503': {description: Code-docs API unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  /api/v1/analytics/product-progress:
+    get:
+      tags: [Analytics API]
+      security:
+        - jwtBearerAuth: []
+      summary: Product Progress charts as ECharts option JSON (Admin/Lead only)
+      description: Re-exposes the same ECharts option objects rendered on /analytics/product-progress — the top type→status pie, the optional per-product status→type pie, and each visible product's deep-dive charts.
+      parameters:
+        - {name: window, in: query, schema: {type: string, enum: [today, week, month, rolling30, rolling90]}, description: 'Restrict counts to tasks active in this window (default: all-time)'}
+        - {name: type, in: query, schema: {type: string, enum: [feature, bug, analysis]}, description: Task-type filter}
+        - {name: blocked, in: query, schema: {type: string, enum: ['1']}, description: 'When "1", only products with backlog > 0'}
+        - {name: ppage, in: query, schema: {type: integer, minimum: 1, default: 1}, description: Product-list pagination page (productProgressPageSize per page)}
+        - {name: product, in: query, schema: {type: string}, description: 'Product code — when set, scopes the response to that single product (collapses pagination) and includes statusTypePieOption'}
+        - {name: pietype, in: query, schema: {type: string, enum: [bug, feature, analysis, enhancement], default: bug}, description: Task type shown in the top type→status pie}
+        - {name: bistatus, in: query, schema: {type: string, enum: [REPORTED, IN_DEV, DEV_DONE, QA_IN_PROGRESS, QA_DONE, QC_IN_PROGRESS, QC_DONE], default: QC_DONE}, description: Lifecycle status shown in the per-product status→type pie (only used when product is set)}
+      responses:
+        '200': {description: Product progress chart options, content: {application/json: {schema: {type: object, additionalProperties: true}}}}
+        '401': {description: Unauthorized, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden — Admin/Lead only, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '500': {description: Fetch failure, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  /api/v1/analytics/module-progress:
+    get:
+      tags: [Analytics API]
+      security:
+        - jwtBearerAuth: []
+      summary: Module Progress charts as ECharts option JSON (Admin/Lead only)
+      description: Re-exposes the same ECharts option objects rendered on /analytics/module-progress (bar, pie, stacked, trend, heatmap, daily).
+      parameters:
+        - {name: audience, in: query, schema: {type: string, enum: [dev, qa, mgmt, custom]}, description: Audience preset (default mgmt); sets the default statusKey}
+        - {name: status, in: query, schema: {type: string, enum: [QC_DONE, QA_DONE, QA_IN_PROGRESS, DEV_DONE, IN_DEV, REPORTED]}, description: Explicit status key, overrides the audience default}
+        - {name: product, in: query, schema: {type: string, default: HISv3}, description: Product code}
+        - {name: showAll, in: query, schema: {type: string, enum: ['1']}, description: 'When "1", include zero-count modules'}
+        - {name: days, in: query, schema: {type: integer}, description: Daily-trend window length in days (see parseDailyWindow)}
+        - {name: from, in: query, schema: {type: string, format: date}, description: Daily-trend custom range start (YYYY-MM-DD)}
+        - {name: to, in: query, schema: {type: string, format: date}, description: Daily-trend custom range end (YYYY-MM-DD)}
+      responses:
+        '200': {description: Module progress chart options, content: {application/json: {schema: {type: object, additionalProperties: true}}}}
+        '401': {description: Unauthorized, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden — Admin/Lead only, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '500': {description: Fetch failure, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  /api/v1/analytics/module-progress-status:
+    get:
+      tags: [Analytics API]
+      security:
+        - jwtBearerAuth: []
+      summary: Module Status charts as ECharts option JSON (Admin/Lead only)
+      description: Re-exposes the same ECharts option objects rendered on /analytics/module-progress-status (pie + bar) for one product+module.
+      parameters:
+        - {name: product, in: query, required: true, schema: {type: string}, description: Product code (required)}
+        - {name: module, in: query, required: true, schema: {type: string}, description: Module code (required)}
+        - {name: from, in: query, schema: {type: string, format: date}, description: Cohort range start (YYYY-MM-DD); empty range = all-time snapshot}
+        - {name: to, in: query, schema: {type: string, format: date}, description: Cohort range end (YYYY-MM-DD)}
+      responses:
+        '200': {description: Module status chart options, content: {application/json: {schema: {type: object, additionalProperties: true}}}}
+        '400': {description: product and module are required, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '401': {description: Unauthorized, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden — Admin/Lead only, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '500': {description: Build failure, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+  /api/v1/analytics/dashboard-summary:
+    get:
+      tags: [Analytics API]
+      security:
+        - jwtBearerAuth: []
+      summary: Executive dashboard summary as ECharts option JSON (Admin/Lead only)
+      description: Org-wide (or product-scoped) snapshot combining current-state KPIs (delivery completion %, open items, modules tracked), a current-state status-mix pie, a current-state type-mix pie, a trailing-12-week delivered-per-week trend, and per-module completion rows. A restricted rest-client with an empty ?product= gets its full product allowlist rather than a single resolved code, since a dashboard is inherently multi-product.
+      parameters:
+        - {name: product, in: query, schema: {type: string}, description: 'Product code — when set, scopes the response to that single product (or, for a restricted rest-client, must be one of its allowed codes); omitted = org-wide for unrestricted callers or the caller''s full allowlist for a restricted rest-client'}
+        - {name: window, in: query, schema: {type: string, enum: [today, week, month, rolling30, rolling90]}, description: 'Reserved for the throughput series; the trailing-12-week delivered trend is currently always anchored to the current week regardless of this value'}
+      responses:
+        '200': {description: Dashboard summary, content: {application/json: {schema: {$ref: '#/components/schemas/DashboardSummaryResponse'}}}}
+        '401': {description: Unauthorized, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '403': {description: Forbidden — Admin/Lead only, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+        '500': {description: Fetch failure, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}}
+components:
+  securitySchemes:
+    bearerAuth: {type: http, scheme: bearer, bearerFormat: opaque}
+    jwtBearerAuth: {type: http, scheme: bearer, bearerFormat: JWT}
+  parameters:
+    TaskID:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^[A-Z0-9]+-[A-Z]+-\d{5}$'
+        example: HISv3-BUG-00077
+      description: >
+        Task identifier — format `{PRODUCT}-{TYPE}-{NNNNN}` (zero-padded 5-digit sequence
+        auto-assigned on creation). Examples: `HISv3-BUG-00077`, `HISv3-FEATURE-00042`,
+        `HISv3-SUBTASK-00001`. Returned as `taskID` in every task response.
+    XTimestamp:
+      name: X-Timestamp
+      in: header
+      required: true
+      schema:
+        type: string
+        example: '1700000000'
+      description: >
+        Current Unix time in **seconds** as a base-10 integer string
+        (Python: `str(int(time.time()))`). Server rejects requests where
+        `|server_time − timestamp| > 300 s` (HTTP 401 "stale timestamp").
+        Generate fresh per call; never reuse.
+    XNonce:
+      name: X-Nonce
+      in: header
+      required: true
+      schema:
+        type: string
+        example: a3f8e2b1c7d94052fe83901abc654d27
+      description: >
+        Unique string per request for replay protection. A second request with the same nonce
+        within the 5-minute window is rejected (HTTP 409 "nonce already used").
+        Generate with `secrets.token_hex(16)` in Python.
+    XSignature:
+      name: X-Signature
+      in: header
+      required: true
+      schema:
+        type: string
+        example: 6df8ec159854f63c4cc79ba20ab2f89f93a72cb2abbba254df1d220f363044e1
+      description: |
+        Hex-encoded HMAC-SHA256 of the canonical request string (shared `ROUTINE_API_HMAC_SECRET`).
+
+        **Canonical string** — five lines joined by `\n`:
+        ```
+        {UPPERCASE_METHOD}
+        {URL_PATH_WITHOUT_QUERY_STRING}
+        {lowercase_hex_SHA256_of_request_body}
+        {X-Timestamp_value}
+        {X-Nonce_value}
+        ```
+        Empty-body SHA-256: `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`
+
+        **Python signing snippet** (see `scripts/routine/call_api.py` for a complete client):
+        ```python
+        import hashlib, hmac as _hmac, time, secrets
+        body      = b''                        # empty for GET requests
+        ts        = str(int(time.time()))
+        nonce     = secrets.token_hex(16)
+        path      = '/api/v1/search/tasks'     # path only, no ?query
+        canonical = '\n'.join(['GET', path,
+                               hashlib.sha256(body).hexdigest(), ts, nonce])
+        sig = _hmac.new(HMAC_SECRET.encode(), canonical.encode(),
+                        hashlib.sha256).hexdigest()
+        ```
+        Reference: `internal/apiauth/hmac.go → canonicalString()`.
+  schemas:
+    ArbitraryObject: {type: object, additionalProperties: true}
+    ErrorResponse: {type: object, properties: {error: {type: string}}}
+    AuthLoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: {type: string}
+        password: {type: string}
+    AuthImpersonateRequest:
+      type: object
+      description: >-
+        Provide either field to resolve the target user; if both are set,
+        targetUserID takes precedence.
+      properties:
+        targetUserID: {type: string}
+        targetUsername: {type: string}
+    AuthUser:
+      type: object
+      properties:
+        id: {type: string}
+        username: {type: string}
+        displayName: {type: string}
+        role: {type: string, description: 'Human role (Developer, DevOps, UI/UX Designer, QA, QC, Admin) or "rest-client" for a machine integration account — see /admin/api-clients. A "rest-client" role always pairs with an all-false AuthPermissions bundle and cannot sign in via the web UI.'}
+        isLead: {type: boolean}
+        isHead: {type: boolean}
+        isTaskCoordinator: {type: boolean}
+        isTaskController: {type: boolean}
+        active: {type: boolean}
+    AuthPermissions:
+      type: object
+      properties:
+        isAdmin: {type: boolean}
+        isAdminOrLead: {type: boolean}
+        isHead: {type: boolean}
+        canManageTasks: {type: boolean}
+        canControlTasks: {type: boolean}
+        canViewAnalytics: {type: boolean}
+        canViewAdmin: {type: boolean}
+        canViewInquiry: {type: boolean}
+        canImport: {type: boolean}
+        canEditTestScenarios: {type: boolean}
+        canUseSlowQueryAnalyzer: {type: boolean}
+        canViewNotes: {type: boolean}
+    AuthLoginResponse:
+      type: object
+      properties:
+        accessToken: {type: string}
+        tokenType: {type: string, example: Bearer}
+        expiresAt: {type: string, format: date-time}
+        user: {$ref: '#/components/schemas/AuthUser'}
+        permissions: {$ref: '#/components/schemas/AuthPermissions'}
+    AuthMeResponse:
+      type: object
+      properties:
+        user: {$ref: '#/components/schemas/AuthUser'}
+        permissions: {$ref: '#/components/schemas/AuthPermissions'}
+    OKResponse:
+      type: object
+      properties:
+        status: {type: string}
+        message: {type: string}
+        principal: {type: string}
+        action: {type: string}
+        method: {type: string}
+        path: {type: string}
+        allowedActions: {type: array, items: {type: string}}
+        receivedAt: {type: string, format: date-time}
+    ValidationErrorResponse:
+      type: object
+      properties:
+        error: {type: string}
+        details: {type: array, items: {type: string}}
+    TaskAPIResponse:
+      type: object
+      properties:
+        taskID: {type: string}
+        title: {type: string}
+        description: {type: string}
+        notes: {type: string}
+        status: {type: string}
+        iterationCount: {type: integer}
+        branchSource: {type: string}
+        tags: {type: array, items: {type: string}}
+        links: {type: array, items: {type: string}}
+        linkLabels: {type: array, items: {type: string}}
+        jamURLs: {type: array, items: {type: string}}
+        jamLabels: {type: array, items: {type: string}}
+        jamActuals: {type: array, items: {type: string}}
+        jamExpecteds: {type: array, items: {type: string}}
+        jamExtraTechs: {type: array, items: {type: string}}
+        reportedAt: {type: string, format: date-time}
+        takenAt: {type: string, format: date-time}
+        devDoneAt: {type: string, format: date-time}
+        qaTakenAt: {type: string, format: date-time}
+        qaDoneAt: {type: string, format: date-time}
+        qcTakenAt: {type: string, format: date-time}
+        qcDoneAt: {type: string, format: date-time}
+        reportedByUserID: {type: string}
+        reportedByDisplayName: {type: string}
+        preAssignedUserID: {type: string}
+        takenByUserID: {type: string}
+        qaTakenByUserID: {type: string}
+        qcTakenByUserID: {type: string}
+        outsourceTeamID: {type: string}
+        outsourceMember: {type: string}
+        outsourceTeamName: {type: string}
+        devDoneProxyUserID: {type: string}
+        devDoneProxyDisplayName: {type: string}
+        devDoneProxyRole: {type: string}
+        isDeleted: {type: boolean}
+        deletedAt: {type: string, format: date-time}
+        deletedKind: {type: string}
+        deletedReason: {type: string}
+        productCode: {type: string}
+        moduleCode: {type: string}
+        reportSourceCode: {type: string}
+        typeCode: {type: string}
+        severityCode: {type: string}
+        priorityCode: {type: string}
+        complexityCode: {type: string}
+        firstLaneRole: {type: string}
+        parentTaskID: {type: string}
+        isSubTask: {type: boolean}
+        isAdHoc: {type: boolean}
+        adHocRaisedBy: {type: string}
+        adHocReason: {type: string}
+        isDraft: {type: boolean}
+        isSupport: {type: boolean}
+        isOnHold: {type: boolean}
+        onHoldReasonCategory: {type: string}
+        onHoldReason: {type: string}
+        onHoldSetAt: {type: string, format: date-time}
+        onHoldSetByUserID: {type: string}
+        onHoldSetByUsername: {type: string}
+        updatedAt: {type: string, format: date-time}
+        attachments: {type: array, items: {type: object}}
+        discussionCount: {type: integer, description: Number of discussion messages posted on this task.}
+    TaskListResponse:
+      type: object
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/TaskAPIResponse'}}
+        total: {type: integer}
+        page: {type: integer}
+        pageSize: {type: integer}
+    TaskDiscussionMention:
+      type: object
+      properties:
+        token: {type: string}
+        mentionedUserID: {type: string}
+        mentionedUsername: {type: string}
+        mentionedDisplayName: {type: string}
+        whatsAppNumber: {type: string}
+        notifyStatus: {type: string}
+        notifiedAt: {type: string, format: date-time}
+    TaskDiscussionMessage:
+      type: object
+      properties:
+        id: {type: string}
+        taskID: {type: string}
+        authorUserID: {type: string}
+        authorUsername: {type: string}
+        authorDisplayName: {type: string}
+        text: {type: string}
+        createdAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+        mentions: {type: array, items: {$ref: '#/components/schemas/TaskDiscussionMention'}}
+    TaskDiscussionListResponse:
+      type: object
+      properties:
+        taskID: {type: string}
+        total: {type: integer}
+        loaded: {type: integer}
+        limit: {type: integer}
+        items: {type: array, items: {$ref: '#/components/schemas/TaskDiscussionMessage'}}
+    RoutineTaskResponse:
+      type: object
+      properties:
+        taskID: {type: string}
+        title: {type: string}
+        status: {type: string}
+        productCode: {type: string}
+        moduleCode: {type: string}
+        typeCode: {type: string}
+        parentTaskID: {type: string}
+        isSubTask: {type: boolean}
+        severityCode: {type: string}
+        priorityCode: {type: string}
+        complexityCode: {type: string}
+        firstLaneRole: {type: string}
+        preAssignedUserID: {type: string}
+        reportedAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+    RoutineTaskCreateRequest:
+      type: object
+      required: [title, productCode, moduleCode, priorityCode]
+      properties:
+        title: {type: string}
+        description: {type: string}
+        notes: {type: string}
+        branchSource: {type: string}
+        productCode: {type: string}
+        moduleCode: {type: string}
+        reportSourceCode: {type: string}
+        typeCode: {type: string, description: Ignored and forced to SUBTASK when parentTaskID is present.}
+        severityCode: {type: string}
+        priorityCode: {type: string}
+        complexityCode: {type: string}
+        tags: {type: array, items: {type: string}}
+        isAdHoc: {type: boolean}
+        adHocRaisedBy: {type: string}
+        adHocReason: {type: string}
+        isDraft: {type: boolean}
+        isSupport: {type: boolean}
+        isOnHold: {type: boolean}
+        onHoldReasonCategory: {type: string}
+        onHoldReason: {type: string}
+        firstLaneRole: {type: string}
+        preAssignedUserID: {type: string}
+        parentTaskID: {type: string, description: Non-empty means create a sub-task under this parent task.}
+        outsourceTeamID: {type: string}
+        outsourceMember: {type: string}
+        reportedAt: {type: string, format: date-time}
+        links: {type: array, items: {type: string}}
+        linkLabels: {type: array, items: {type: string}}
+        jamURLs: {type: array, items: {type: string}}
+        jamLabels: {type: array, items: {type: string}}
+        jamActuals: {type: array, items: {type: string}}
+        jamExpecteds: {type: array, items: {type: string}}
+      additionalProperties: false
+    RoutineTaskPatchRequest:
+      type: object
+      properties:
+        title: {type: string}
+        description: {type: string}
+        branchSource: {type: string}
+        tags: {type: array, items: {type: string}}
+        moduleCode: {type: string}
+        reportSourceCode: {type: string}
+        typeCode: {type: string}
+        severityCode: {type: string}
+        priorityCode: {type: string}
+        complexityCode: {type: string}
+        firstLaneRole: {type: string}
+        isAdHoc: {type: boolean}
+        adHocRaisedBy: {type: string}
+        adHocReason: {type: string}
+        isDraft: {type: boolean}
+        isSupport: {type: boolean}
+      additionalProperties: false
+    RoutineActorRequest:
+      type: object
+      required: [actorUserID]
+      properties:
+        actorUserID: {type: string, description: Existing TaskMgr user ID that performs the action.}
+      additionalProperties: false
+    RoutineRejectRequest:
+      type: object
+      required: [actorUserID, reason]
+      properties:
+        actorUserID: {type: string}
+        reason: {type: string}
+        target: {type: string, description: QC reject only. One of dev or qa.}
+        link: {type: string}
+      additionalProperties: false
+    RoutineHoldRequest:
+      type: object
+      required: [actorUserID, onHoldReasonCategory]
+      properties:
+        actorUserID: {type: string}
+        onHoldReasonCategory: {type: string}
+        onHoldReason: {type: string}
+      additionalProperties: false
+    RoutineAssignmentRequest:
+      type: object
+      required: [actorUserID, mode]
+      properties:
+        actorUserID: {type: string}
+        mode: {type: string, description: One of preassign, reassign, dev, qa, qc.}
+        preAssignedUserID: {type: string}
+        targetUserID: {type: string}
+        assigneeType: {type: string, description: dev mode only. staff or outsource.}
+        outsourceMember: {type: string}
+      additionalProperties: false
+    TaskStatusRequest: {type: object, properties: {status: {type: string}}, additionalProperties: true}
+    TaskNoteRequest: {type: object, required: [note], properties: {note: {type: string}}, additionalProperties: true}
+    WorklogSyncWindowResult: {type: object, properties: {window: {type: string}, ok: {type: boolean}, error: {type: string}}}
+    WorklogSyncResponse: {type: object, properties: {status: {type: string}, syncedAt: {type: string, format: date-time}, windows: {type: array, items: {$ref: '#/components/schemas/WorklogSyncWindowResult'}}}}
+    WeeklyTargetSyncResponse: {type: object, properties: {status: {type: string}, syncedAt: {type: string, format: date-time}, week: {type: string}, tab: {type: string}, created: {type: integer}, updated: {type: integer}, skipped: {type: integer}, tabMissing: {type: boolean}, error: {type: string}}}
+    ChatIngestRequest: {type: object, properties: {date: {type: string}, slot: {type: string}}}
+    ChatTaskMatch: {type: object, properties: {taskID: {type: string}, title: {type: string}, percent: {type: integer}, confidence: {type: string}}}
+    SearchTasksResponse: {type: object, properties: {matches: {type: array, items: {$ref: '#/components/schemas/ChatTaskMatch'}}}}
+    JamCheckMatch: {type: object, properties: {taskID: {type: string}, title: {type: string}, status: {type: string}}}
+    JamCheckResponse: {type: object, properties: {matches: {type: array, items: {$ref: '#/components/schemas/JamCheckMatch'}}}}
+    MasterProduct:
+      type: object
+      properties:
+        code: {type: string}
+        name: {type: string}
+        description: {type: string}
+        odooProjectID: {type: string}
+        outsourceTeamID: {type: string}
+        outsourceTeamName: {type: string}
+        picID: {type: string}
+        picName: {type: string}
+        allowAnyUserTask: {type: boolean}
+        active: {type: boolean}
+        createdAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+    MasterModule:
+      type: object
+      properties:
+        code: {type: string}
+        name: {type: string}
+        productCode: {type: string}
+        parentCode: {type: string}
+        level: {type: integer}
+        active: {type: boolean}
+        createdAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+    CreateModuleRequest:
+      type: object
+      required: [code, name, productCode]
+      properties:
+        code: {type: string, example: LAB_QC}
+        name: {type: string}
+        productCode: {type: string}
+        parentCode: {type: string}
+        level: {type: integer, minimum: 1, maximum: 4}
+    UpdateModuleRequest:
+      type: object
+      required: [name, productCode]
+      properties:
+        name: {type: string}
+        productCode: {type: string}
+        parentCode: {type: string}
+        level: {type: integer, minimum: 1, maximum: 4}
+    RenameModuleCodeRequest:
+      type: object
+      required: [newCode]
+      properties:
+        newCode: {type: string, example: LAB_QC_V2}
+    MasterClient:
+      type: object
+      properties:
+        code: {type: string}
+        name: {type: string}
+        active: {type: boolean}
+        createdAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+    MasterOutsourceTeam:
+      type: object
+      properties:
+        id: {type: string}
+        name: {type: string}
+        members: {type: array, items: {type: string}}
+        active: {type: boolean}
+        createdAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+    CreateSummaryResponse: {type: object, properties: {status: {type: string}, threadKey: {type: string}}}
+    ChatSummaryRecord:
+      type: object
+      required: [date, group]
+      properties:
+        threadKey: {type: string}
+        date: {type: string}
+        slot: {type: string}
+        group: {type: string}
+        firstMsgId: {type: string}
+        summary: {type: string}
+        module: {type: string}
+        type: {type: string}
+        severity: {type: string}
+        priority: {type: string}
+        complexity: {type: string}
+        tags: {type: array, items: {type: string}}
+        todos: {type: array, items: {type: string}}
+        jamUrls: {type: array, items: {type: string}}
+        jamMatchedTaskId: {type: string}
+        senders: {type: string}
+        topMatches: {type: array, items: {$ref: '#/components/schemas/ChatTaskMatch'}}
+        createdAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+        decision: {type: string}
+        note: {type: string}
+        dismissedMatchIds: {type: array, items: {type: string}}
+        createdTaskId: {type: string}
+        attachedMatches: {type: array, items: {$ref: '#/components/schemas/ChatTaskMatch'}}
+        done: {type: boolean}
+    CodeDocVariant:
+      type: object
+      properties:
+        name: {type: string}
+        section: {type: string}
+        snippet: {type: string}
+        note: {type: string}
+    CodeDocHit:
+      type: object
+      properties:
+        component: {type: string}
+        slug: {type: string}
+        intro: {type: string}
+        cssSource: {type: string}
+        matchedVariant: {type: string}
+        snippet: {type: string}
+        note: {type: string}
+        section: {type: string}
+        variants: {type: array, items: {$ref: '#/components/schemas/CodeDocVariant'}}
+        related: {type: array, items: {type: string}}
+        docUrl: {type: string}
+        similarity: {type: number, format: double}
+    CodeDocSearchResponse:
+      type: object
+      properties:
+        query: {type: string}
+        resultCount: {type: integer}
+        results: {type: array, items: {$ref: '#/components/schemas/CodeDocHit'}}
+    CodeDocComponent:
+      type: object
+      properties:
+        component: {type: string}
+        slug: {type: string}
+        intro: {type: string}
+        cssSource: {type: string}
+        docUrl: {type: string}
+        variants: {type: array, items: {$ref: '#/components/schemas/CodeDocVariant'}}
+        related: {type: array, items: {type: string}}
+    CodeDocComponentSummary:
+      type: object
+      properties:
+        component: {type: string}
+        slug: {type: string}
+        docUrl: {type: string}
+        variantCount: {type: integer}
+    CodeDocComponentsResponse:
+      type: object
+      properties:
+        count: {type: integer}
+        components: {type: array, items: {$ref: '#/components/schemas/CodeDocComponentSummary'}}
+    DashboardKPI:
+      type: object
+      properties:
+        deliveryCompletionPct: {type: integer, description: 'QC_DONE / total, 0-100 rounded'}
+        openItems: {type: integer, description: 'total non-deleted tasks not yet at QC_DONE'}
+        modulesTracked: {type: integer, description: 'active modules in scope'}
+    DashboardModuleRow:
+      type: object
+      properties:
+        code: {type: string}
+        name: {type: string}
+        completionPct: {type: integer, description: 'QC_DONE / total for this module, 0-100 rounded'}
+    DashboardSummaryResponse:
+      type: object
+      properties:
+        kpi: {$ref: '#/components/schemas/DashboardKPI'}
+        statusPieOption: {allOf: [{$ref: '#/components/schemas/ArbitraryObject'}], nullable: true, description: 'ECharts donut option — org task count BY lifecycle status; null when the scope has no tasks'}
+        typePieOption: {allOf: [{$ref: '#/components/schemas/ArbitraryObject'}], nullable: true, description: 'ECharts donut option — org task count BY type; null when the scope has no tasks'}
+        throughputOption: {allOf: [{$ref: '#/components/schemas/ArbitraryObject'}], nullable: true, description: 'ECharts line option — trailing 12-week delivered (QC_DONE) per week; null when there is no delivery activity in the window'}
+        modules: {type: array, items: {$ref: '#/components/schemas/DashboardModuleRow'}, description: 'per-module completion rows; always [] (never omitted) even for a deny-all-scoped caller'}
