@@ -1,6 +1,7 @@
 <script setup>
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, computed, watch } from 'vue'
 import UsersPage from './UsersPage.vue'
+import StatsPage from './StatsPage.vue'
 
 // --- version / update check ---
 const BUILD_ID = Date.now() // set at build time, embedded in JS bundle
@@ -11,13 +12,11 @@ onMounted(async () => {
     await loginAndFetch()
   }
   await loadUserNames()
+  await loadCustomTags()
   if (taskToken.value) {
     await fetchProducts()
-    if (!selectedProduct.value && products.value.length) {
-      selectedProduct.value = products.value.map(p => p.code || p.productCode || p.name).sort()[0]
-      localStorage.setItem('task_selected_product', selectedProduct.value)
-    }
-    fetchTasks(searchQuery.value)
+    // no auto-select: tasks load only for products chosen in the Product filter
+    if (selectedProducts.value.length) fetchTasks(searchQuery.value)
   }
   // poll for new build
   checkNewBuild()
@@ -78,27 +77,23 @@ const loginAndFetch = async () => {
   loading.value = true
   error.value = null
   fetchStatus.value = 'Logging in...'
-  
+
   try {
     const loginRes = await fetch('/api/v1/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(loginData.value)
     })
-    
+
     if (!loginRes.ok) throw new Error('Login failed')
     const data = await loginRes.json()
     taskToken.value = data.accessToken
     localStorage.setItem('task_token', taskToken.value)
     await loadUserNames()
-    
+    await loadCustomTags()
+
     await fetchProducts()
-    // auto-select first product if none selected yet
-    if (!selectedProduct.value && products.value.length) {
-      selectedProduct.value = products.value.map(p => p.code || p.productCode || p.name).sort()[0]
-      localStorage.setItem('task_selected_product', selectedProduct.value)
-    }
-    await fetchTasks('')
+    if (selectedProducts.value.length) await fetchTasks('')
   } catch (err) {
     error.value = err.message
     loading.value = false
@@ -107,48 +102,70 @@ const loginAndFetch = async () => {
 
 const fetchTasks = async (search) => {
   if (!taskToken.value) return loginAndFetch()
-  if (!selectedProduct.value) return
-  
+  // Tasks are only fetched for products explicitly selected in the Product filter.
+  if (!selectedProducts.value.length) {
+    tasks.value = []
+    fetchStatus.value = 'Select at least one product to load tasks'
+    return
+  }
+
   loading.value = true
   fetchStatus.value = 'Fetching tasks...'
   error.value = null
-  
+
   try {
-    let allItems = []
-    let currentPage = 1
     const pageSize = 100 // API hard limit
-    
-    while (true) {
-      let url = `/api/v1/tasks?pageSize=${pageSize}&page=${currentPage}`
-      if (search) url += `&search=${encodeURIComponent(search)}`
-      if (selectedProduct.value) url += `&product=${encodeURIComponent(selectedProduct.value)}`
-      
-      const res = await fetch(url, {
-        headers: { 'Authorization': `Bearer ${taskToken.value}` }
-      })
-      
-      if (res.status === 401) {
-        taskToken.value = ''
-        localStorage.removeItem('task_token')
-        return loginAndFetch()
+    const seen = new Set()
+    const allItems = []
+    let failedProduct = null
+
+    // Fetch each selected product independently (API only supports one product param)
+    for (const product of selectedProducts.value) {
+      let currentPage = 1
+      while (true) {
+        let url = `/api/v1/tasks?pageSize=${pageSize}&page=${currentPage}&product=${encodeURIComponent(product)}`
+        if (search) url += `&search=${encodeURIComponent(search)}`
+
+        const res = await fetch(url, {
+          headers: { 'Authorization': `Bearer ${taskToken.value}` }
+        })
+
+        if (res.status === 401) {
+          taskToken.value = ''
+          localStorage.removeItem('task_token')
+          return loginAndFetch()
+        }
+
+        if (!res.ok) {
+          failedProduct = product
+          break
+        }
+
+        const data = await res.json()
+        const fetchedItems = data.items || []
+
+        for (const item of fetchedItems) {
+          const id = item.taskID || item.id
+          if (id && !seen.has(id)) {
+            seen.add(id)
+            allItems.push(item)
+          }
+        }
+
+        if (fetchedItems.length < pageSize || allItems.length >= (data.total || 0)) {
+          break
+        }
+
+        currentPage++
+        fetchStatus.value = `Fetching ${product} (Page ${currentPage})...`
       }
-      
-      if (!res.ok) throw new Error(`Failed to fetch tasks (Page ${currentPage})`)
-      
-      const data = await res.json()
-      const fetchedItems = data.items || []
-      
-      allItems = allItems.concat(fetchedItems)
-      
-      // If we got fewer items than the pageSize, we've reached the last page
-      if (fetchedItems.length < pageSize || allItems.length >= (data.total || 0)) {
-        break
-      }
-      
-      currentPage++
-      fetchStatus.value = `Fetching tasks (Page ${currentPage})...`
+      if (failedProduct) break
     }
-    
+
+    if (failedProduct) {
+      throw new Error(`Failed to fetch tasks for product: ${failedProduct}`)
+    }
+
     tasks.value = allItems
     fetchStatus.value = `Loaded ${tasks.value.length} tasks`
   } catch (err) {
@@ -185,13 +202,51 @@ const getAssignColor = (uid) => {
 
 const statusOrder = ["REPORTED", "IN_DEV", "DEV_DONE", "QA_IN_PROGRESS", "QA_DONE", "QC_IN_PROGRESS", "QC_DONE", "HOLD", "DELETED"]
 
-// Load persisted filters or use defaults
+// --- Filter state (all persisted) ---
+// EXCEL-STYLE semantics (v6):
+//  - Each filter: empty selection = All; multiple values OR together.
+//  - Filters AND together (a task must pass EVERY active filter).
+//  - A task matches on its OWN values only (no inheritance, no roll-up).
+//  - Status hiding = row hidden: hidden statuses never render.
+//  - Tree = display only: a node renders if it matches the filters OR has a
+//    visible child (container). Nothing is "deleted" conceptually — a parent
+//    row stays so its matching children remain reachable, exactly like an
+//    Excel row that contains a matching cell stays visible.
 const savedStatuses = localStorage.getItem('task_hidden_statuses')
 const hiddenStatuses = ref(savedStatuses ? JSON.parse(savedStatuses) : ['QC_DONE', 'QA_DONE', 'DELETED'])
-const selectedProduct = ref(localStorage.getItem('task_selected_product') || '')
-const assigneeFilter = ref(localStorage.getItem('task_assignee_filter') || '')
+const selectedProducts = ref(JSON.parse(localStorage.getItem('task_selected_products') || '[]'))
+const assigneesFilter = ref(JSON.parse(localStorage.getItem('task_assignee_filter') || '[]'))
 const searchQuery = ref(localStorage.getItem('task_search_query') || '')
 const blockerFilter = ref(localStorage.getItem('task_blocker_filter') || 'all')
+const sprintsFilter = ref(JSON.parse(localStorage.getItem('task_sprint_filter') || '[]'))
+
+// Parent filter: single-select. 'all' = no parent filter; otherwise show only
+// the chosen parent and its subtree (direct children + descendants). Persisted.
+const parentFilter = ref(localStorage.getItem('task_parent_filter') || 'all')
+const setParentFilter = (value) => {
+  parentFilter.value = value
+  localStorage.setItem('task_parent_filter', value)
+}
+
+// Sort mode: 'reported' = reportedAt descending (newest first, default);
+// 'status' = status workflow order. Persisted.
+const savedSort = localStorage.getItem('task_sort_mode')
+const sortMode = ref(savedSort === 'status' ? 'status' : 'reported')
+const setSortMode = (mode) => {
+  sortMode.value = mode
+  localStorage.setItem('task_sort_mode', mode)
+}
+
+const sortCompare = (a, b) => {
+  if (sortMode.value === 'status') return getStatusVal(a.status) - getStatusVal(b.status)
+  // reportedAt descending: newest first; missing dates sort last (stable).
+  const ta = a.reportedAt || a.createdAt || ''
+  const tb = b.reportedAt || b.createdAt || ''
+  if (!ta && !tb) return 0
+  if (!ta) return 1
+  if (!tb) return -1
+  return new Date(tb) - new Date(ta)
+}
 
 const searchTasks = () => {
   searchQuery.value = searchQuery.value.trim()
@@ -226,10 +281,36 @@ const updateUserName = async (uid, name) => {
   else userNames.value[uid] = name.trim()
 }
 
-const customTags = ref(JSON.parse(localStorage.getItem('task_custom_tags') || '{}'))
+const customTags = ref({})
 
-const saveCustomTags = () => {
-  localStorage.setItem('task_custom_tags', JSON.stringify(customTags.value))
+// Load custom tags (sprint, blocker, dates) from DB
+const loadCustomTags = async () => {
+  try {
+    const res = await fetch('/api/task-tags')
+    if (res.ok) customTags.value = await res.json()
+  } catch { /* proxy not ready */ }
+}
+
+const DB_TAG_FIELDS = ['isBlocker', 'inDate', 'devDoneDate', 'sprint']
+let taskTagSaveQueue = {}
+let taskTagSaveTimer = null
+
+const saveCustomTags = (taskID) => {
+  taskTagSaveQueue[taskID] = { ...customTags.value[taskID] }
+  if (taskTagSaveTimer) clearTimeout(taskTagSaveTimer)
+  taskTagSaveTimer = setTimeout(async () => {
+    const pending = taskTagSaveQueue
+    taskTagSaveQueue = {}
+    for (const [id, tags] of Object.entries(pending)) {
+      try {
+        await fetch('/api/task-tags', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ taskID: id, ...tags }),
+        })
+      } catch { /* ignore */ }
+    }
+  }, 400)
 }
 
 const copyTask = (task) => {
@@ -240,16 +321,17 @@ const copyTask = (task) => {
 const updateCustomTag = (task, field, value) => {
   const id = task.taskID || task.id
   if (!customTags.value[id]) {
-    customTags.value[id] = { isBlocker: false, inDevDate: '', devDoneDate: '' }
+    customTags.value[id] = { isBlocker: false, inDate: '', devDoneDate: '', sprint: '' }
   }
   customTags.value[id][field] = value
-  
+
   // Clean up if all empty
-  if (!customTags.value[id].isBlocker && !customTags.value[id].inDevDate && !customTags.value[id].devDoneDate) {
+  if (!customTags.value[id].isBlocker && !customTags.value[id].inDate &&
+      !customTags.value[id].devDoneDate && !customTags.value[id].sprint) {
     delete customTags.value[id]
   }
-  
-  saveCustomTags()
+
+  saveCustomTags(id)
 }
 
 const flatTaskTree = computed(() => {
@@ -264,26 +346,77 @@ const flatTaskTree = computed(() => {
   return result
 })
 
+// summary of active filters, shown on the Stats tab
+const filterSummary = computed(() => {
+  const parts = []
+  parts.push(selectedProducts.value.length ? `Product: ${selectedProducts.value.join(', ')}` : 'Product: All')
+  parts.push(assigneesFilter.value.length
+    ? `Assignee: ${assigneesFilter.value.map(u => u === '__unassigned__' ? 'Not Assigned' : (userNames.value[u] || u)).join(', ')}`
+    : 'Assignee: All')
+  parts.push(sprintsFilter.value.length
+    ? `Sprint: ${sprintsFilter.value.map(s => s === '__nosprint__' ? 'Not in Sprint' : s).join(', ')}`
+    : 'Sprint: All')
+  parts.push(`Blocker: ${blockerFilter.value === 'all' ? 'All' : blockerFilter.value === 'blocked' ? 'Blocked' : 'Not Blocked'}`)
+  if (hiddenStatuses.value.length) parts.push(`Hidden statuses: ${hiddenStatuses.value.join(', ')}`)
+  if (searchQuery.value) parts.push(`Search: "${searchQuery.value}"`)
+  return parts.join('  ·  ')
+})
+
+const exportToExcel = () => {
+  const rows = flatTaskTree.value.map(task => ({
+    '#': task._depth,
+    STATUS: getEffectiveStatus(task),
+    ID: task.taskID || task.id,
+    TITLE: (task._depth ? '↳ '.repeat(task._depth) : '') + (task.title || ''),
+    PRODUCT: task.productCode || task.product || '',
+    ASSIGNEE: getUserName(task),
+    BLOCKER: customTags.value[task.taskID || task.id]?.isBlocker ? 'Yes' : '',
+    SPRINT: customTags.value[task.taskID || task.id]?.sprint || '',
+    'IN DEV': customTags.value[task.taskID || task.id]?.inDate || '',
+    'DEV DONE': customTags.value[task.taskID || task.id]?.devDoneDate || ''
+  }))
+  // Build TSV (tab-separated) — pastes cleanly into Excel
+  const headers = Object.keys(rows[0] || {})
+  const esc = v => String(v ?? '').replace(/\t/g, ' ').replace(/\n/g, ' ')
+  const tsv = [headers.join('\t'), ...rows.map(r => headers.map(h => esc(r[h])).join('\t'))].join('\n')
+  const blob = new Blob([tsv], { type: 'text/tab-separated-values;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  const product = selectedProducts.value.join('_') || 'all'
+  const d = new Date()
+  const stamp = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`
+  a.href = url
+  a.download = `tasks_${product}_${stamp}.tsv`
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
 const toggleStatus = (status) => {
   const idx = hiddenStatuses.value.indexOf(status)
   if (idx === -1) hiddenStatuses.value.push(status)
   else hiddenStatuses.value.splice(idx, 1)
-  
+
   localStorage.setItem('task_hidden_statuses', JSON.stringify(hiddenStatuses.value))
 }
 
-const updateProductFilter = () => {
-  localStorage.setItem('task_selected_product', selectedProduct.value)
-  if (selectedProduct.value) {
-    tasks.value = []
-    fetchTasks(searchQuery.value)
-  } else {
-    tasks.value = []
+const setAllStatuses = (hide) => {
+  hiddenStatuses.value = hide ? [...statusOrder] : []
+  localStorage.setItem('task_hidden_statuses', JSON.stringify(hiddenStatuses.value))
+  // Show All is a FULL RESET: also clear every other client-side filter so the
+  // list actually shows everything again. Hide All only touches statuses.
+  if (!hide) {
+    sprintsFilter.value = []
+    localStorage.setItem('task_sprint_filter', '[]')
+    assigneesFilter.value = []
+    localStorage.setItem('task_assignee_filter', '[]')
+    blockerFilter.value = 'all'
+    localStorage.setItem('task_blocker_filter', 'all')
+    setParentFilter('all')
+    searchQuery.value = ''
+    localStorage.setItem('task_search_query', '')
   }
-}
-
-const updateAssigneeFilter = () => {
-  localStorage.setItem('task_assignee_filter', assigneeFilter.value)
 }
 
 const getStatusVal = (status) => {
@@ -306,71 +439,184 @@ const availableAssignees = computed(() => {
   return Array.from(set).sort().map(uid => ({ uid, name: userNames.value[uid] || uid }))
 })
 
+// Parent filter options: task IDs that are parents of at least one loaded task.
+const parentOptions = computed(() => {
+  const set = new Set()
+  tasks.value.forEach(t => {
+    if (t.parentTaskID) set.add(t.parentTaskID)
+  })
+  return Array.from(set).sort()
+})
+
+const availableSprints = computed(() => {
+  // own-tag sprint values only (no parent inheritance) — matches the filter
+  const set = new Set()
+  tasks.value.forEach(t => {
+    const s = customTags.value[t.taskID || t.id]?.sprint
+    if (s) set.add(s)
+  })
+  return Array.from(set).sort()
+})
+
+// --- Excel-style multi-filter chip state ---
+const activeFilterChip = ref('')
+const toggleFilterChip = (name) => {
+  activeFilterChip.value = activeFilterChip.value === name ? '' : name
+}
+
+// --- per-filter dropdown search (Excel/Sheets-style: filter the option list) ---
+const filterSearch = ref({ product: '', assignee: '', sprint: '' })
+const setFilterSearch = (name, value) => {
+  filterSearch.value[name] = value
+  if (value) activeFilterChip.value = name // keep dropdown open while typing
+}
+const filteredProducts = computed(() =>
+  availableProducts.value.filter(p => p.toLowerCase().includes(filterSearch.value.product.toLowerCase()))
+)
+const filteredAssignees = computed(() => {
+  const q = filterSearch.value.assignee.toLowerCase()
+  return availableAssignees.value.filter(a => a.name.toLowerCase().includes(q) || a.uid.toLowerCase().includes(q))
+})
+const filteredSprints = computed(() =>
+  availableSprints.value.filter(s => s.toLowerCase().includes(filterSearch.value.sprint.toLowerCase()))
+)
+
+// --- multi-select helpers (generic) ---
+const toggleInList = (listRef, value) => {
+  const arr = listRef.value
+  const idx = arr.indexOf(value)
+  if (idx === -1) arr.push(value)
+  else arr.splice(idx, 1)
+  localStorage.setItem(listRef._key, JSON.stringify(arr))
+}
+// bind localStorage keys to list refs
+const FILTER_KEYS = {
+  selectedProducts: 'task_selected_products',
+  assigneesFilter: 'task_assignee_filter',
+  sprintsFilter: 'task_sprint_filter',
+}
+for (const [k, key] of Object.entries(FILTER_KEYS)) {
+  const r = { selectedProducts, assigneesFilter, sprintsFilter }[k]
+  r._key = key
+}
+
+const toggleProductFilter = (prod) => {
+  toggleInList(selectedProducts, prod)
+  // Load tasks only for the products selected in the filter
+  if (!selectedProducts.value.length) {
+    tasks.value = []
+    fetchStatus.value = 'Select at least one product to load tasks'
+  } else {
+    fetchTasks(searchQuery.value)
+  }
+}
+const toggleAssigneeFilter = (uid) => toggleInList(assigneesFilter, uid)
+const toggleSprintFilter = (sprint) => toggleInList(sprintsFilter, sprint)
+
+const clearFilter = (name) => {
+  const listRef = { selectedProducts, assigneesFilter, sprintsFilter }[name]
+  listRef.value = []
+  localStorage.setItem(listRef._key, '[]')
+  // also reset the popup search box so the option list is not left filtered
+  if (name === 'selectedProducts') filterSearch.value.product = ''
+  if (name === 'assigneesFilter') filterSearch.value.assignee = ''
+  if (name === 'sprintsFilter') filterSearch.value.sprint = ''
+  if (listRef === selectedProducts) {
+    tasks.value = []
+    fetchStatus.value = 'Select at least one product to load tasks'
+  }
+}
+
+// --- task filtering (EXCEL-STYLE: own values only, tree = display) ---
+const getTaskProduct = (task) => task.productCode || task.product || ''
+const getTaskAssignee = (task) => task.assigneeUserID || task.preAssignedUserID || task.takenByUserID || ''
+const getTaskSprint = (task) => customTags.value[task.taskID || task.id]?.sprint || ''
+
+// matchesColumn: pure per-task predicate on the task's OWN values.
+// Empty = All; values OR; filters AND.
+const matchesColumn = (task) => {
+  // Product
+  if (selectedProducts.value.length && !selectedProducts.value.includes(getTaskProduct(task))) return false
+  // Assignee (__unassigned__ = no assignee)
+  if (assigneesFilter.value.length) {
+    const a = getTaskAssignee(task)
+    const wantUnassigned = assigneesFilter.value.includes('__unassigned__')
+    if (!wantUnassigned && !a) return false
+    if (a && !assigneesFilter.value.includes(a)) return false
+    if (!a && !wantUnassigned) return false
+  }
+  // Sprint (__nosprint__ = no sprint)
+  if (sprintsFilter.value.length) {
+    const s = getTaskSprint(task)
+    const wantNoSprint = sprintsFilter.value.includes('__nosprint__')
+    if (!wantNoSprint && !s) return false
+    if (s && !sprintsFilter.value.includes(s)) return false
+    if (!s && !wantNoSprint) return false
+  }
+  // Blocker
+  if (blockerFilter.value === 'blocked' && !customTags.value[task.taskID || task.id]?.isBlocker) return false
+  if (blockerFilter.value === 'not_blocked' && customTags.value[task.taskID || task.id]?.isBlocker) return false
+  // Status (hidden = row hidden, never rendered)
+  if (hiddenStatuses.value.includes(getEffectiveStatus(task))) return false
+  // Parent filter: only the chosen parent and its subtree
+  if (parentFilter.value !== 'all') {
+    if ((task.taskID || task.id) === parentFilter.value) return true // the parent itself
+    let cur = task
+    while (cur) {
+      if (!cur.parentTaskID) return false // reached a root that isn't the chosen parent
+      if (cur.parentTaskID === parentFilter.value) return true // descendant of chosen parent
+      cur = taskMap.value[cur.parentTaskID]
+      if (!cur) return false
+    }
+    return false
+  }
+  return true
+}
+
+const taskMap = computed(() => {
+  const map = {}
+  if (tasks.value.length) {
+    tasks.value.forEach(t => {
+      map[t.taskID || t.id] = t
+    })
+  }
+  return map
+})
+
 const taskTree = computed(() => {
   if (!tasks.value.length) return []
-  
-  const taskMap = {}
+
+  // Build a fresh copy of the tree (no mutation of raw tasks).
+  const map = {}
   tasks.value.forEach(t => {
     const id = t.taskID || t.id
-    taskMap[id] = { ...t, children: [] }
+    map[id] = { ...t, children: [] }
   })
-  
   const roots = []
-  
-  Object.values(taskMap).forEach(t => {
-    if (t.parentTaskID && taskMap[t.parentTaskID]) {
-      taskMap[t.parentTaskID].children.push(t)
-    } else {
-      roots.push(t)
-    }
+  Object.values(map).forEach(t => {
+    if (t.parentTaskID && map[t.parentTaskID]) map[t.parentTaskID].children.push(t)
+    else roots.push(t)
   })
-  
-  // Sort children, and apply filtering if needed
-  Object.values(taskMap).forEach(t => {
-    t.children = t.children
-      .filter(child => !selectedProduct.value || child.productCode === selectedProduct.value)
-      .sort((a, b) => getStatusVal(a.status) - getStatusVal(b.status))
-  })
-  
-  // Helper to check if a node or any of its descendants should be visible
-  const isVisible = (node) => {
-    // If it doesn't match the product filter, hide it and all children
-    if (selectedProduct.value && node.productCode && node.productCode !== selectedProduct.value) {
-      return false;
-    }
-    
-    // Filter children first (needed for all downstream filters)
-    node.children = node.children.filter(child => isVisible(child))
-    
-    // If assignee filter is active
-    if (assigneeFilter.value) {
-      const nodeAssignee = node.assigneeUserID || node.preAssignedUserID || node.takenByUserID || ''
-      const selfMatch = nodeAssignee === assigneeFilter.value || (!nodeAssignee && assigneeFilter.value === '__unassigned__')
-      // Keep node if self matches OR any child matches
-      if (!selfMatch && node.children.length === 0) return false
-    }
-    
-    // If blocker filter is active
-    if (blockerFilter.value === 'blocked') {
-      const selfBlocker = customTags.value[node.taskID || node.id]?.isBlocker
-      const childHasBlocker = node.children.length > 0
-      if (!selfBlocker && !childHasBlocker) return false
-    }
-    if (blockerFilter.value === 'not_blocked') {
-      const selfBlocker = customTags.value[node.taskID || node.id]?.isBlocker
-      if (selfBlocker) return false
-    }
-    
-    // Check hidden statuses
-    const effectiveStatus = getEffectiveStatus(node)
-    const nodeVisible = !hiddenStatuses.value.includes(effectiveStatus)
-    
-    return nodeVisible || node.children.length > 0
+
+  // EXCEL-STYLE walk: a node renders if it matches the filter columns OR has
+  // a visible child (container). A hidden-status node also stays as a
+  // container (hidden status = row hidden, but its matching children still
+  // show under it — Excel keeps the row context). Children keep their parent;
+  // nothing is promoted or orphaned.
+  const collectVisible = (node) => {
+    node.children = node.children.filter(child => collectVisible(child))
+    if (matchesColumn(node)) return true
+    return node.children.length > 0
   }
-  
-  return roots
-    .filter(t => isVisible(t))
-    .sort((a, b) => getStatusVal(a.status) - getStatusVal(b.status))
+
+  const visibleRoots = roots.filter(r => collectVisible(r))
+  // Sort per level
+  const sortTree = (nodes) => {
+    nodes.sort(sortCompare)
+    nodes.forEach(n => sortTree(n.children))
+  }
+  sortTree(visibleRoots)
+  return visibleRoots
 })
 
 const getStatusColor = (status) => {
@@ -399,6 +645,11 @@ const getEffectiveStatus = (task) => {
 // --- user auth for worklog submissions ---
 const userLoginData = ref(JSON.parse(localStorage.getItem('user_credentials') || 'null') || { username: '', password: '' })
 const userLoginError = ref('')
+
+// auto-save credentials to localStorage on change
+watch(userLoginData, (v) => {
+  localStorage.setItem('user_credentials', JSON.stringify(v))
+}, { deep: true })
 
 // --- worklog inline form ---
 const worklogTaskId = ref(null)
@@ -468,43 +719,133 @@ const submitWorklog = async (task) => {
       <h1>Task Tree Viewer</h1>
       <div class="nav-tabs">
         <button class="nav-tab" :class="{ active: activePage === 'tasks' }" @click="activePage='tasks'">Tasks</button>
+        <button class="nav-tab" :class="{ active: activePage === 'stats' }" @click="activePage='stats'">📊 Stats</button>
         <button class="nav-tab" :class="{ active: activePage === 'users' }" @click="activePage='users'">Users</button>
       </div>
       <div class="actions" v-if="activePage === 'tasks'">
+        <!-- Excel/Sheets-style filter bar -->
         <div class="filters">
-          <span class="filter-label">Product:</span>
-          <select v-model="selectedProduct" @change="updateProductFilter" class="product-select">
-            <option value="">All Products</option>
-            <option v-for="prod in availableProducts" :key="prod" :value="prod">
-              {{ prod }}
-            </option>
-          </select>
+          <input type="text" v-model="searchQuery" @keydown="handleSearchKeydown" placeholder="🔍 Search ID / title / keyword..."
+                 class="filter-search" />
 
-          <span class="filter-label" style="margin-left:4px;">Blocker:</span>
-          <select v-model="blockerFilter" @change="updateBlockerFilter" class="product-select" style="max-width:140px;">
-            <option value="all">All</option>
-            <option value="blocked">🚫 Blocked</option>
-            <option value="not_blocked">✅ Not Blocked</option>
-          </select>
+          <!-- Column filter chips: Product / Assignee / Sprint / Blocker -->
+          <div class="filter-chip-group">
+            <div class="filter-chip-wrap">
+              <button class="filter-chip" :class="{ active: activeFilterChip === 'product' }"
+                      @click.stop="toggleFilterChip('product')">
+                Product
+                <span class="chip-count" v-if="selectedProducts.length">{{ selectedProducts.length }}</span>
+                <span class="chip-caret">▾</span>
+              </button>
+              <div v-if="activeFilterChip === 'product'" class="filter-popup" @click.stop>
+                <div class="popup-head">
+                  <span>Product</span>
+                  <button class="popup-clear" @click="clearFilter('selectedProducts')">Clear</button>
+                </div>
+                <div class="popup-search">
+                  <input type="text" v-model="filterSearch.product" @input="setFilterSearch('product', $event.target.value)"
+                         placeholder="🔍 Search product..." />
+                </div>
+                <label v-for="p in filteredProducts" :key="p" class="popup-option">
+                  <input type="checkbox" :checked="selectedProducts.includes(p)" @change="toggleProductFilter(p)" />
+                  <span>{{ p }}</span>
+                </label>
+                <div class="popup-empty" v-if="!filteredProducts.length">No matching products</div>
+              </div>
+            </div>
 
-          <span class="filter-label">Assignee:</span>
-          <select v-model="assigneeFilter" @change="updateAssigneeFilter" class="product-select" style="max-width:200px;">
-            <option value="">All</option>
-            <option v-for="a in availableAssignees" :key="a.uid" :value="a.uid" :style="{ borderLeft: '4px solid ' + getAssignColor(a.uid) }">
-              {{ a.name }}
-            </option>
-          </select>
+            <div class="filter-chip-wrap">
+              <button class="filter-chip" :class="{ active: activeFilterChip === 'assignee' }"
+                      @click.stop="toggleFilterChip('assignee')">
+                Assignee
+                <span class="chip-count" v-if="assigneesFilter.length">{{ assigneesFilter.length }}</span>
+                <span class="chip-caret">▾</span>
+              </button>
+              <div v-if="activeFilterChip === 'assignee'" class="filter-popup" @click.stop>
+                <div class="popup-head">
+                  <span>Assignee</span>
+                  <button class="popup-clear" @click="clearFilter('assigneesFilter')">Clear</button>
+                </div>
+                <div class="popup-search">
+                  <input type="text" v-model="filterSearch.assignee" @input="setFilterSearch('assignee', $event.target.value)"
+                         placeholder="🔍 Search assignee..." />
+                </div>
+                <label class="popup-option">
+                  <input type="checkbox" :checked="assigneesFilter.includes('__unassigned__')"
+                         @change="toggleAssigneeFilter('__unassigned__')" />
+                  <span class="popup-notassigned">🚫 Not Assigned</span>
+                </label>
+                <label v-for="a in filteredAssignees" :key="a.uid" class="popup-option">
+                  <input type="checkbox" :checked="assigneesFilter.includes(a.uid)" @change="toggleAssigneeFilter(a.uid)" />
+                  <span class="popup-color-dot" :style="{ backgroundColor: getAssignColor(a.uid) }"></span>
+                  <span>{{ a.name }}</span>
+                </label>
+                <div class="popup-empty" v-if="!filteredAssignees.length">No matching assignees</div>
+              </div>
+            </div>
 
-          <span class="filter-label">ID/Title:</span>
-          <input type="text" v-model="searchQuery" @keydown="handleSearchKeydown" placeholder="search keyword..." style="padding:4px 8px;font-size:0.85rem;border:1px solid #d1d5db;border-radius:4px;width:180px" />
+            <div class="filter-chip-wrap">
+              <button class="filter-chip" :class="{ active: activeFilterChip === 'sprint' }"
+                      @click.stop="toggleFilterChip('sprint')">
+                Sprint
+                <span class="chip-count" v-if="sprintsFilter.length">{{ sprintsFilter.length }}</span>
+                <span class="chip-caret">▾</span>
+              </button>
+              <div v-if="activeFilterChip === 'sprint'" class="filter-popup" @click.stop>
+                <div class="popup-head">
+                  <span>Sprint</span>
+                  <button class="popup-clear" @click="clearFilter('sprintsFilter')">Clear</button>
+                </div>
+                <div class="popup-search">
+                  <input type="text" v-model="filterSearch.sprint" @input="setFilterSearch('sprint', $event.target.value)"
+                         placeholder="🔍 Search sprint..." />
+                </div>
+                <label class="popup-option">
+                  <input type="checkbox" :checked="sprintsFilter.includes('__nosprint__')"
+                         @change="toggleSprintFilter('__nosprint__')" />
+                  <span class="popup-notassigned">🚫 Not in Sprint</span>
+                </label>
+                <label v-for="s in filteredSprints" :key="s" class="popup-option">
+                  <input type="checkbox" :checked="sprintsFilter.includes(s)" @change="toggleSprintFilter(s)" />
+                  <span>{{ s }}</span>
+                </label>
+                <div class="popup-empty" v-if="!filteredSprints.length">No matching sprints</div>
+              </div>
+            </div>
+
+            <div class="filter-chip-wrap">
+              <select v-model="blockerFilter" @change="updateBlockerFilter" class="filter-chip-select" title="Blocker filter">
+                <option value="all">Blocker: All</option>
+                <option value="blocked">🚫 Blocked</option>
+                <option value="not_blocked">✅ Not Blocked</option>
+              </select>
+            </div>
+
+            <div class="filter-chip-wrap">
+              <select :value="sortMode" @change="setSortMode($event.target.value)" class="filter-chip-select" title="Sort order">
+                <option value="reported">Sort: Reported (newest)</option>
+                <option value="status">Sort: Status order</option>
+              </select>
+            </div>
+
+            <div class="filter-chip-wrap">
+              <select :value="parentFilter" @change="setParentFilter($event.target.value)" class="filter-chip-select" title="Parent filter">
+                <option value="all">Parent: All</option>
+                <option v-for="p in parentOptions" :key="p" :value="p">{{ p }}</option>
+              </select>
+            </div>
+          </div>
 
           <span class="filter-label" style="margin-left: 10px;">Hide Statuses:</span>
           <label v-for="status in statusOrder" :key="status" class="filter-toggle">
             <input type="checkbox" :checked="hiddenStatuses.includes(status)" @change="toggleStatus(status)" />
             <span class="badge filter-badge" :style="{ backgroundColor: getStatusColor(status) }">{{ status }}</span>
           </label>
+          <button class="filter-chip status-bulk" style="margin-left:6px;" @click="setAllStatuses(true)">Hide All</button>
+          <button class="filter-chip status-bulk" @click="setAllStatuses(false)">Show All</button>
         </div>
         <div style="display: flex; gap: 15px; align-items: center;">
+          <button @click="exportToExcel" title="Download current view as TSV (opens in Excel)" class="export-btn">📊 Export Excel</button>
           <button @click="fetchTasks(searchQuery)" :disabled="loading">
             {{ loading ? 'Refreshing...' : 'Refresh Tasks' }}
           </button>
@@ -529,16 +870,23 @@ const submitWorklog = async (task) => {
         <span style="color:#6b7280;font-size:0.85rem;">Logging in...</span>
       </div>
 
-      <div v-if="!selectedProduct" class="empty-state">Select a product to load tasks</div>
+      <div v-if="!flatTaskTree.length && tasks.length && !loading" class="empty-state">
+        No tasks match the current filters ({{ tasks.length }} loaded)
+      </div>
+      <div v-if="!tasks.length && !loading" class="empty-state">
+        {{ selectedProducts.length ? 'No tasks found' : 'Select at least one product to load tasks' }}
+      </div>
       <div class="table-container" v-if="flatTaskTree.length">
         <table class="task-table">
         <thead>
           <tr>
+            <th>Product</th>
             <th>Status</th>
             <th>ID</th>
             <th>Title</th>
             <th>Ass.</th>
             <th class="center">Blocker</th>
+            <th>Sprint</th>
             <th>In Dev</th>
             <th>Dev Done</th>
             <th class="center">Work</th>
@@ -547,6 +895,11 @@ const submitWorklog = async (task) => {
         <tbody>
           <template v-for="task in flatTaskTree" :key="task.taskID || task.id">
           <tr class="task-row" :class="{ deleted: task.isDeleted }">
+            <td>
+              <span class="product-badge" v-if="getTaskProduct(task)">
+                {{ getTaskProduct(task) }}
+              </span>
+            </td>
             <td>
               <span class="badge" :style="{ backgroundColor: getStatusColor(getEffectiveStatus(task)), marginLeft: (task._depth * 20) + 'px'}">
                 {{ getEffectiveStatus(task) }}
@@ -559,15 +912,21 @@ const submitWorklog = async (task) => {
             </td>
             <td class="cell-title">
               <div class="scrollable-title" :style="{ paddingLeft: (task._depth * 20) + 'px' }">
+                <a :href="'https://taskmanager.minipc.sismedika.biz.id/tasks/' + (task.taskID || task.id)"
+                   target="_blank" class="task-link"
+                   :class="{ 'task-link-sub': task._depth > 0 }"
+                   title="Open task in TaskManager">
+                  <span v-if="task._depth > 0" class="tree-branch">↳ </span>{{ task.title }}
+                </a>
                 <button class="copy-btn" @click="copyTask(task)" title="Copy ID | Title">📋</button>
-                <div style="display: flex;"><span v-if="task._depth > 0" class="tree-branch">↳ </span><div>{{ task.title }}</div></div>
               </div>
             </td>
             <td>
-              <span class="task-assignee" v-if="task.assigneeUserID || task.preAssignedUserID || task.takenByUserID"
+              <span class="task-assignee" v-if="getTaskAssignee(task)"
                     :style="{ backgroundColor: getUserColor(task) + '22', color: getUserColor(task), borderColor: getUserColor(task) + '44' }">
                 {{ getUserName(task) }}
               </span>
+              <span class="task-assignee unassigned" v-else>—</span>
             </td>
             <td class="center">
               <input type="checkbox"
@@ -575,9 +934,17 @@ const submitWorklog = async (task) => {
                      @change="e => updateCustomTag(task, 'isBlocker', e.target.checked)" />
             </td>
             <td>
+              <input type="text" class="compact-input"
+                     :value="customTags[task.taskID || task.id]?.sprint || ''"
+                     @change="e => updateCustomTag(task, 'sprint', e.target.value)"
+                     :readonly="userLoginData.username !== 'rajif'"
+                     :title="userLoginData.username !== 'rajif' ? 'Read-only — only rajif can edit sprints' : ''"
+                     placeholder="Sprint #" />
+            </td>
+            <td>
               <input type="date" class="compact-date"
-                     :value="customTags[task.taskID || task.id]?.inDevDate || ''"
-                     @change="e => updateCustomTag(task, 'inDevDate', e.target.value)" />
+                     :value="customTags[task.taskID || task.id]?.inDate || ''"
+                     @change="e => updateCustomTag(task, 'inDate', e.target.value)" />
             </td>
             <td>
               <input type="date" class="compact-date"
@@ -594,7 +961,7 @@ const submitWorklog = async (task) => {
           </tr>
           <!-- inline worklog form row -->
           <tr v-if="worklogTaskId === (task.taskID || task.id)" class="worklog-row">
-            <td colspan="8">
+            <td colspan="10">
               <div class="worklog-inline">
                 <input v-model="worklogForm.description" type="text" placeholder="Description..." class="worklog-input" />
                 <input v-model="worklogForm.date" type="date" class="worklog-input worklog-date" />
@@ -613,6 +980,10 @@ const submitWorklog = async (task) => {
         </tbody>
       </table>
     </div>
+    </div>
+
+    <div v-if="activePage === 'stats'">
+      <StatsPage :tasks="flatTaskTree" :filter-summary="filterSummary" />
     </div>
 
     <div v-if="activePage === 'users'">
@@ -698,10 +1069,165 @@ h1 { margin: 0; font-size: 1.5rem; }
   border: 1px solid #e5e7eb;
 }
 
+.filter-search {
+  padding: 5px 10px;
+  border-radius: 4px;
+  border: 1px solid #d1d5db;
+  font-size: 0.85rem;
+  width: 220px;
+}
+
 .filter-label {
   font-weight: 500;
   font-size: 0.9rem;
   margin-right: 5px;
+}
+
+.filter-chip-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.filter-chip-wrap {
+  position: relative;
+  display: inline-block;
+}
+
+.filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: white;
+  border: 1px solid #d1d5db;
+  color: #374151;
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 0.82rem;
+  font-weight: 500;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.filter-chip:hover { border-color: #2563eb; color: #2563eb; background: #eff6ff; }
+.filter-chip.active { border-color: #2563eb; color: #2563eb; background: #eff6ff; }
+
+.chip-count {
+  background: #2563eb;
+  color: white;
+  border-radius: 8px;
+  font-size: 0.68rem;
+  padding: 0 5px;
+  line-height: 14px;
+  font-weight: 700;
+}
+.chip-caret { font-size: 0.7rem; color: #9ca3af; }
+
+.filter-chip-select {
+  padding: 4px 8px;
+  border-radius: 4px;
+  border: 1px solid #d1d5db;
+  font-size: 0.82rem;
+  background: white;
+  color: #374151;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+/* --- Excel/Sheets-style filter popup --- */
+.filter-popup {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 100;
+  min-width: 200px;
+  max-width: 280px;
+  max-height: 320px;
+  overflow-y: auto;
+  background: white;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  padding: 6px 0;
+}
+
+.popup-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 12px 6px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #6b7280;
+  border-bottom: 1px solid #e5e7eb;
+  margin-bottom: 4px;
+  position: sticky;
+  top: 0;
+  background: white;
+}
+
+.popup-clear {
+  background: transparent;
+  color: #2563eb;
+  border: none;
+  padding: 0;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.popup-clear:hover { text-decoration: underline; }
+
+.popup-search {
+  padding: 4px 8px 8px;
+  position: sticky;
+  top: 26px;
+  background: white;
+  z-index: 1;
+}
+.popup-search input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 5px 8px;
+  font-size: 0.8rem;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  outline: none;
+}
+.popup-search input:focus {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15);
+}
+
+.popup-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  font-size: 0.82rem;
+  color: #374151;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.popup-option:hover { background: #f3f4f6; }
+.popup-option input[type="checkbox"] { margin: 0; accent-color: #2563eb; }
+
+.popup-color-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.popup-notassigned {
+  color: #9ca3af;
+  font-style: italic;
+}
+
+.popup-empty {
+  padding: 8px 12px;
+  font-size: 0.78rem;
+  color: #9ca3af;
 }
 
 .product-select {
@@ -737,6 +1263,8 @@ button {
   font-weight: 500;
 }
 .logout-btn { background: #dc2626; }
+.export-btn { background: #16a34a; }
+.export-btn:hover { background: #15803d; }
 button:hover:not(:disabled) { background: #1d4ed8; }
 .logout-btn:hover { background: #b91c1c; }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
@@ -811,6 +1339,11 @@ input {
 }
 .task-id:hover { text-decoration: underline; }
 
+/* Title cell: the whole title is now the link to the task */
+.task-link { color: #111827; text-decoration: none; }
+.task-link:hover { color: #2563eb; text-decoration: underline; }
+.task-link-sub { color: #374151; }
+
 .cell-title {
   max-width: 300px;
   min-width: 250px;
@@ -856,6 +1389,21 @@ input {
   border-radius: 4px;
   white-space: nowrap;
 }
+.task-assignee.unassigned {
+  background: transparent;
+  color: #9ca3af;
+  border: 1px dashed #d1d5db;
+}
+
+.product-badge {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #1d4ed8;
+  background: #dbeafe;
+  padding: 2px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
 
 .center { text-align: center; }
 
@@ -865,6 +1413,20 @@ input {
   border-radius: 4px;
   font-size: 0.8rem;
   color: #374151;
+}
+
+.compact-input {
+  padding: 4px;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  color: #374151;
+  width: 70px;
+}
+.compact-input[readonly] {
+  background: #f3f4f6;
+  color: #6b7280;
+  cursor: not-allowed;
 }
 
 /* --- worklog inline form --- */

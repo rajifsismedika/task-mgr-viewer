@@ -14,6 +14,13 @@ db.run(`CREATE TABLE IF NOT EXISTS user_names (
   uid TEXT PRIMARY KEY,
   name TEXT NOT NULL
 )`)
+db.run(`CREATE TABLE IF NOT EXISTS task_tags (
+  taskID TEXT PRIMARY KEY,
+  isBlocker INTEGER NOT NULL DEFAULT 0,
+  inDate TEXT NOT NULL DEFAULT '',
+  devDoneDate TEXT NOT NULL DEFAULT '',
+  sprint TEXT NOT NULL DEFAULT ''
+)`)
 
 const app = express()
 
@@ -21,6 +28,48 @@ const app = express()
 app.use(express.static(join(__dirname, 'dist')))
 
 // --- local API routes ---
+app.get('/api/task-tags', (_req, res) => {
+  const rows = db.query('SELECT * FROM task_tags').all()
+  const out = {}
+  for (const r of rows) {
+    out[r.taskID] = {
+      isBlocker: !!r.isBlocker,
+      inDate: r.inDate || '',
+      devDoneDate: r.devDoneDate || '',
+      sprint: r.sprint || '',
+    }
+  }
+  res.json(out)
+})
+
+app.put('/api/task-tags', express.json(), (req, res) => {
+  const { taskID } = req.body || {}
+  const b = req.body || {}
+  if (!taskID) return res.status(400).json({ error: 'taskID required' })
+
+  const isBlocker = b.isBlocker ? 1 : 0
+  const inDate = String(b.inDate || '')
+  const devDoneDate = String(b.devDoneDate || '')
+  const sprint = String(b.sprint || '')
+
+  // If everything empty → delete row
+  if (!isBlocker && !inDate && !devDoneDate && !sprint) {
+    db.run('DELETE FROM task_tags WHERE taskID = ?', [taskID])
+  } else {
+    db.run(
+      `INSERT INTO task_tags (taskID, isBlocker, inDate, devDoneDate, sprint)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(taskID) DO UPDATE SET
+         isBlocker = excluded.isBlocker,
+         inDate = excluded.inDate,
+         devDoneDate = excluded.devDoneDate,
+         sprint = excluded.sprint`,
+      [taskID, isBlocker, inDate, devDoneDate, sprint],
+    )
+  }
+  res.json({ ok: true })
+})
+
 app.get('/api/user-names', (_req, res) => {
   const rows = db.query('SELECT uid, name FROM user_names').all()
   res.json(Object.fromEntries(rows.map(r => [r.uid, r.name])))
