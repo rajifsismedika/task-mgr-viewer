@@ -16,7 +16,7 @@ onMounted(async () => {
   if (taskToken.value) {
     await fetchProducts()
     // no auto-select: tasks load only for products chosen in the Product filter
-    if (selectedProducts.value.length) fetchTasks(searchQuery.value)
+    if (selectedProducts.value.length) fetchTasks()
   }
   // poll for new build
   checkNewBuild()
@@ -93,14 +93,14 @@ const loginAndFetch = async () => {
     await loadCustomTags()
 
     await fetchProducts()
-    if (selectedProducts.value.length) await fetchTasks('')
+    if (selectedProducts.value.length) await fetchTasks()
   } catch (err) {
     error.value = err.message
     loading.value = false
   }
 }
 
-const fetchTasks = async (search) => {
+const fetchTasks = async () => {
   if (!taskToken.value) return loginAndFetch()
   // Tasks are only fetched for products explicitly selected in the Product filter.
   if (!selectedProducts.value.length) {
@@ -123,8 +123,7 @@ const fetchTasks = async (search) => {
     for (const product of selectedProducts.value) {
       let currentPage = 1
       while (true) {
-        let url = `/api/v1/tasks?pageSize=${pageSize}&page=${currentPage}&product=${encodeURIComponent(product)}`
-        if (search) url += `&search=${encodeURIComponent(search)}`
+        const url = `/api/v1/tasks?pageSize=${pageSize}&page=${currentPage}&product=${encodeURIComponent(product)}`
 
         const res = await fetch(url, {
           headers: { 'Authorization': `Bearer ${taskToken.value}` }
@@ -175,10 +174,13 @@ const fetchTasks = async (search) => {
   }
 }
 
-const getUserName = (task) => {
-  const uid = task.assigneeUserID || task.preAssignedUserID || task.takenByUserID
-  return uid ? (userNames.value[uid] || uid) : ''
-}
+// Resolve any user ID to a mapped name (Users page maintains the mapping).
+const userName = (uid) => (uid ? (userNames.value[uid] || uid.slice(0, 8)) : '')
+// ponytail: unmapped users fall back to an 8-char ID prefix; widen once names exist in Users page.
+const getUserName = (task) => userName(task.assigneeUserID || task.preAssignedUserID || task.takenByUserID)
+
+// ISO timestamp -> YYYY-MM-DD for table display.
+const fmtDate = (ts) => (ts ? String(ts).slice(0, 10) : '')
 
 const userColors = {}
 const getUserColor = (task) => {
@@ -217,8 +219,31 @@ const hiddenStatuses = ref(savedStatuses ? JSON.parse(savedStatuses) : ['QC_DONE
 const selectedProducts = ref(JSON.parse(localStorage.getItem('task_selected_products') || '[]'))
 const assigneesFilter = ref(JSON.parse(localStorage.getItem('task_assignee_filter') || '[]'))
 const searchQuery = ref(localStorage.getItem('task_search_query') || '')
+// Frontend-only search: no `search` param is ever sent to the API.
+const doSearch = () => { searchQuery.value = searchQuery.value.trim() }
 const blockerFilter = ref(localStorage.getItem('task_blocker_filter') || 'all')
 const sprintsFilter = ref(JSON.parse(localStorage.getItem('task_sprint_filter') || '[]'))
+
+// Date-range filter: per-field from/to (YYYY-MM-DD, inclusive, both optional).
+const DATE_FIELDS = [
+  { key: 'reportedAt', label: 'Reported' },
+  { key: 'takenAt', label: 'Taken' },
+  { key: 'devDoneAt', label: 'Dev Done' },
+  { key: 'qaTakenAt', label: 'QA Taken' },
+]
+const dateFilter = ref(JSON.parse(localStorage.getItem('task_date_filter') || '{}'))
+const setDateFilter = (field, bound, value) => {
+  if (!dateFilter.value[field]) dateFilter.value[field] = {}
+  if (value) dateFilter.value[field][bound] = value
+  else delete dateFilter.value[field][bound]
+  if (!Object.keys(dateFilter.value[field]).length) delete dateFilter.value[field]
+  localStorage.setItem('task_date_filter', JSON.stringify(dateFilter.value))
+}
+const clearDateFilter = () => {
+  dateFilter.value = {}
+  localStorage.setItem('task_date_filter', '{}')
+}
+const activeDateCount = () => Object.keys(dateFilter.value).length
 
 // Parent filter: single-select. 'all' = no parent filter; otherwise show only
 // the chosen parent and its subtree (direct children + descendants). Persisted.
@@ -249,9 +274,7 @@ const sortCompare = (a, b) => {
 }
 
 const searchTasks = () => {
-  searchQuery.value = searchQuery.value.trim()
-  localStorage.setItem('task_search_query', searchQuery.value)
-  fetchTasks(searchQuery.value)
+  doSearch()
 }
 
 const handleSearchKeydown = (e) => {
@@ -357,6 +380,10 @@ const filterSummary = computed(() => {
     ? `Sprint: ${sprintsFilter.value.map(s => s === '__nosprint__' ? 'Not in Sprint' : s).join(', ')}`
     : 'Sprint: All')
   parts.push(`Blocker: ${blockerFilter.value === 'all' ? 'All' : blockerFilter.value === 'blocked' ? 'Blocked' : 'Not Blocked'}`)
+  for (const { key, label } of DATE_FIELDS) {
+    const r = dateFilter.value[key]
+    if (r && (r.from || r.to)) parts.push(`${label}: ${r.from || '…'} → ${r.to || '…'}`)
+  }
   if (hiddenStatuses.value.length) parts.push(`Hidden statuses: ${hiddenStatuses.value.join(', ')}`)
   if (searchQuery.value) parts.push(`Search: "${searchQuery.value}"`)
   return parts.join('  ·  ')
@@ -370,10 +397,13 @@ const exportToExcel = () => {
     TITLE: (task._depth ? '↳ '.repeat(task._depth) : '') + (task.title || ''),
     PRODUCT: task.productCode || task.product || '',
     ASSIGNEE: getUserName(task),
+    'REPORTED BY': userName(task.reportedByUserID),
     BLOCKER: customTags.value[task.taskID || task.id]?.isBlocker ? 'Yes' : '',
     SPRINT: customTags.value[task.taskID || task.id]?.sprint || '',
-    'IN DEV': customTags.value[task.taskID || task.id]?.inDate || '',
-    'DEV DONE': customTags.value[task.taskID || task.id]?.devDoneDate || ''
+    TAKEN: fmtDate(task.takenAt),
+    'DEV DONE': fmtDate(task.devDoneAt),
+    'QA BY': userName(task.qaTakenByUserID),
+    'QA TAKEN': fmtDate(task.qaTakenAt)
   }))
   // Build TSV (tab-separated) — pastes cleanly into Excel
   const headers = Object.keys(rows[0] || {})
@@ -416,6 +446,7 @@ const setAllStatuses = (hide) => {
     setParentFilter('all')
     searchQuery.value = ''
     localStorage.setItem('task_search_query', '')
+    clearDateFilter()
   }
 }
 
@@ -507,7 +538,7 @@ const toggleProductFilter = (prod) => {
     tasks.value = []
     fetchStatus.value = 'Select at least one product to load tasks'
   } else {
-    fetchTasks(searchQuery.value)
+    fetchTasks()
   }
 }
 const toggleAssigneeFilter = (uid) => toggleInList(assigneesFilter, uid)
@@ -558,6 +589,13 @@ const matchesColumn = (task) => {
   if (blockerFilter.value === 'not_blocked' && customTags.value[task.taskID || task.id]?.isBlocker) return false
   // Status (hidden = row hidden, never rendered)
   if (hiddenStatuses.value.includes(getEffectiveStatus(task))) return false
+  // Date ranges (per-field from/to, inclusive)
+  for (const { key } of DATE_FIELDS) {
+    const r = dateFilter.value[key]
+    if (r && !inDateRange(task[key], r.from, r.to)) return false
+  }
+  // Frontend-only text search
+  if (!matchesSearch(task)) return false
   // Parent filter: only the chosen parent and its subtree
   if (parentFilter.value !== 'all') {
     if ((task.taskID || task.id) === parentFilter.value) return true // the parent itself
@@ -582,6 +620,30 @@ const taskMap = computed(() => {
   }
   return map
 })
+
+// Frontend-only text search over the fields shown in the table.
+const matchesSearch = (task) => {
+  const q = searchQuery.value.trim().toLowerCase()
+  if (!q) return true
+  const id = task.taskID || task.id || ''
+  return [id, task.title, task.description,
+    getUserName(task),
+    userName(task.reportedByUserID), userName(task.qaTakenByUserID)]
+    .some(v => String(v || '').toLowerCase().includes(q))
+}
+
+// Inclusive YYYY-MM-DD range check against a task timestamp (null-safe).
+const inDateRange = (ts, from, to) => {
+  if (!from && !to) return true
+  if (!ts) return false
+  const day = ts.slice(0, 10)
+  return (!from || day >= from) && (!to || day <= to)
+}
+
+const dateRangeActive = (field) => {
+  const r = dateFilter.value[field]
+  return !!(r && (r.from || r.to))
+}
 
 const taskTree = computed(() => {
   if (!tasks.value.length) return []
@@ -725,7 +787,7 @@ const submitWorklog = async (task) => {
       <div class="actions" v-if="activePage === 'tasks'">
         <!-- Excel/Sheets-style filter bar -->
         <div class="filters">
-          <input type="text" v-model="searchQuery" @keydown="handleSearchKeydown" placeholder="🔍 Search ID / title / keyword..."
+          <input type="text" v-model="searchQuery" @keydown="handleSearchKeydown" placeholder="🔍 Filter ID / title / user... (client-side)"
                  class="filter-search" />
 
           <!-- Column filter chips: Product / Assignee / Sprint / Blocker -->
@@ -814,6 +876,32 @@ const submitWorklog = async (task) => {
             </div>
 
             <div class="filter-chip-wrap">
+              <button class="filter-chip" :class="{ active: activeFilterChip === 'date' }"
+                      @click.stop="toggleFilterChip('date')">
+                Date
+                <span class="chip-count" v-if="activeDateCount()">{{ activeDateCount() }}</span>
+                <span class="chip-caret">▾</span>
+              </button>
+              <div v-if="activeFilterChip === 'date'" class="filter-popup" style="padding: 10px 12px;" @click.stop>
+                <div class="popup-head">
+                  <span>Date ranges</span>
+                  <button class="popup-clear" @click="clearDateFilter">Clear</button>
+                </div>
+                <div v-for="f in DATE_FIELDS" :key="f.key" class="date-filter-row">
+                  <div class="date-filter-label">{{ f.label }}</div>
+                  <input type="date" class="compact-date"
+                         :value="(dateFilter[f.key] || {}).from || ''"
+                         @change="setDateFilter(f.key, 'from', $event.target.value)" />
+                  <span class="date-filter-sep">–</span>
+                  <input type="date" class="compact-date"
+                         :value="(dateFilter[f.key] || {}).to || ''"
+                         @change="setDateFilter(f.key, 'to', $event.target.value)" />
+                </div>
+                <div class="popup-empty" v-if="!DATE_FIELDS.some(f => dateRangeActive(f.key))">No range set (All dates)</div>
+              </div>
+            </div>
+
+            <div class="filter-chip-wrap">
               <select v-model="blockerFilter" @change="updateBlockerFilter" class="filter-chip-select" title="Blocker filter">
                 <option value="all">Blocker: All</option>
                 <option value="blocked">🚫 Blocked</option>
@@ -846,7 +934,7 @@ const submitWorklog = async (task) => {
         </div>
         <div style="display: flex; gap: 15px; align-items: center;">
           <button @click="exportToExcel" title="Download current view as TSV (opens in Excel)" class="export-btn">📊 Export Excel</button>
-          <button @click="fetchTasks(searchQuery)" :disabled="loading">
+          <button @click="fetchTasks()" :disabled="loading">
             {{ loading ? 'Refreshing...' : 'Refresh Tasks' }}
           </button>
           <button @click="logout" class="logout-btn">Logout</button>
@@ -885,10 +973,13 @@ const submitWorklog = async (task) => {
             <th>ID</th>
             <th>Title</th>
             <th>Ass.</th>
+            <th>Reported By</th>
             <th class="center">Blocker</th>
             <th>Sprint</th>
-            <th>In Dev</th>
+            <th>Taken</th>
             <th>Dev Done</th>
+            <th>QA By</th>
+            <th>QA Taken</th>
             <th class="center">Work</th>
           </tr>
         </thead>
@@ -928,6 +1019,7 @@ const submitWorklog = async (task) => {
               </span>
               <span class="task-assignee unassigned" v-else>—</span>
             </td>
+            <td class="cell-user">{{ userName(task.reportedByUserID) }}</td>
             <td class="center">
               <input type="checkbox"
                      :checked="customTags[task.taskID || task.id]?.isBlocker"
@@ -941,16 +1033,10 @@ const submitWorklog = async (task) => {
                      :title="userLoginData.username !== 'rajif' ? 'Read-only — only rajif can edit sprints' : ''"
                      placeholder="Sprint #" />
             </td>
-            <td>
-              <input type="date" class="compact-date"
-                     :value="customTags[task.taskID || task.id]?.inDate || ''"
-                     @change="e => updateCustomTag(task, 'inDate', e.target.value)" />
-            </td>
-            <td>
-              <input type="date" class="compact-date"
-                     :value="customTags[task.taskID || task.id]?.devDoneDate || ''"
-                     @change="e => updateCustomTag(task, 'devDoneDate', e.target.value)" />
-            </td>
+            <td class="cell-date">{{ fmtDate(task.takenAt) }}</td>
+            <td class="cell-date">{{ fmtDate(task.devDoneAt) }}</td>
+            <td class="cell-user">{{ userName(task.qaTakenByUserID) }}</td>
+            <td class="cell-date">{{ fmtDate(task.qaTakenAt) }}</td>
             <td class="center">
               <button class="worklog-btn" @click="toggleWorklog(task)"
                       :class="{ active: worklogTaskId === (task.taskID || task.id) }"
@@ -961,7 +1047,7 @@ const submitWorklog = async (task) => {
           </tr>
           <!-- inline worklog form row -->
           <tr v-if="worklogTaskId === (task.taskID || task.id)" class="worklog-row">
-            <td colspan="10">
+            <td colspan="13">
               <div class="worklog-inline">
                 <input v-model="worklogForm.description" type="text" placeholder="Description..." class="worklog-input" />
                 <input v-model="worklogForm.date" type="date" class="worklog-input worklog-date" />
@@ -1414,6 +1500,24 @@ input {
   font-size: 0.8rem;
   color: #374151;
 }
+
+/* --- date-range filter popup rows --- */
+.date-filter-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 0;
+}
+.date-filter-label {
+  width: 72px;
+  flex: none;
+  font-size: 0.8rem;
+  color: #374151;
+  font-weight: 500;
+}
+.date-filter-sep { color: #9ca3af; }
+.cell-date { font-size: 0.78rem; color: #374151; white-space: nowrap; }
+.cell-user { font-size: 0.78rem; color: #374151; white-space: nowrap; max-width: 110px; overflow: hidden; text-overflow: ellipsis; }
 
 .compact-input {
   padding: 4px;
