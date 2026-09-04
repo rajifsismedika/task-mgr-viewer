@@ -5,9 +5,27 @@ const props = defineProps({
   tasks: { type: Array, default: () => [] },
   userNames: { type: Object, default: () => ({}) },
   updateUserName: { type: Function, default: () => {} },
+  pullMasterUsers: { type: Function, default: null },
 })
 
 const search = ref('')
+const pulling = ref(false)
+const pullMsg = ref('')
+
+const doPull = async () => {
+  if (!props.pullMasterUsers || pulling.value) return
+  pulling.value = true
+  pullMsg.value = ''
+  try {
+    const { added } = await props.pullMasterUsers()
+    pullMsg.value = added ? `✓ filled ${added} name(s)` : 'All loaded users already named'
+  } catch (e) {
+    pullMsg.value = e.message
+  } finally {
+    pulling.value = false
+    setTimeout(() => { pullMsg.value = '' }, 4000)
+  }
+}
 
 const allUserIds = computed(() => {
   const set = new Set()
@@ -53,6 +71,11 @@ const setName = (uid, name) => {
     <div class="search-bar">
       <input v-model="search" placeholder="filter by ID or name..." class="uid-search" />
       <span class="result-count">{{ filteredIds.length }} / {{ allUserIds.length }}</span>
+      <button v-if="pullMasterUsers" class="pull-btn" :disabled="pulling" @click="doPull"
+              title="Fetch /api/v1/master/users and fill names for IDs that have none">
+        {{ pulling ? 'Pulling...' : '⬇ Pull from TaskManager' }}
+      </button>
+      <span v-if="pullMsg" class="pull-msg">{{ pullMsg }}</span>
     </div>
 
     <div v-if="!filteredIds.length" class="empty-state" style="padding:30px;text-align:center;color:#9ca3af;">
@@ -95,6 +118,20 @@ const setName = (uid, name) => {
   max-width: 400px;
 }
 .result-count { font-size: 0.8rem; color: #6b7280; white-space: nowrap; }
+.pull-btn {
+  padding: 6px 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  background: white;
+  color: #374151;
+  font-size: 0.82rem;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.pull-btn:hover:not(:disabled) { border-color: #2563eb; color: #2563eb; background: #eff6ff; }
+.pull-btn:disabled { opacity: 0.6; cursor: wait; }
+.pull-msg { font-size: 0.8rem; color: #16a34a; white-space: nowrap; }
 .uid-table-wrap { border: 1px solid #e5e7eb; border-radius: 6px; overflow: hidden; }
 .uid-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
 .uid-table th {

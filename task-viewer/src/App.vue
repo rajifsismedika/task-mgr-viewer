@@ -2,6 +2,7 @@
 import { ref, onMounted, computed, watch } from 'vue'
 import UsersPage from './UsersPage.vue'
 import StatsPage from './StatsPage.vue'
+import WeeklyPlanPage from './WeeklyPlanPage.vue'
 
 // --- version / update check ---
 const BUILD_ID = Date.now() // set at build time, embedded in JS bundle
@@ -52,6 +53,37 @@ const products = ref([])
 const error = ref(null)
 const loading = ref(false)
 const activePage = ref('tasks')
+
+// One shared active week: date is always normalized to Monday (local time).
+const localDate = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+const mondayOf = value => { const d = new Date(`${value}T12:00:00`); d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); return localDate(d) }
+const activePlanWeek = ref(mondayOf(localDate(new Date())))
+const activePlanEntries = ref({})
+const loadActivePlan = async () => {
+  const r = await fetch(`/api/week-plan?week=${activePlanWeek.value}`)
+  if (!r.ok) return
+  const raw = await r.json()
+  const priority = { HIGH: 'High', MEDIUM: 'Medium', NORMAL: 'Normal', LOW: 'Low' }
+  const status = { PLANNED: 'Not Started', IN_PROGRESS: 'In Progress', BLOCKED: 'Blocked', DONE: 'Done', DROPPED: 'Declined' }
+  activePlanEntries.value = Object.fromEntries(Object.entries(raw).map(([id, p]) => [id, {
+    ...p, priority: priority[p.priority] || p.priority || 'Normal', status: status[p.status] || p.status || 'Not Started',
+  }]))
+}
+watch(activePlanWeek, loadActivePlan, { immediate: true })
+const planTask = async (task, isAdhoc) => {
+  const taskID = task.taskID || task.id
+  if (activePlanEntries.value[taskID]) return
+  const today = localDate(new Date())
+  const p = { taskID, week: activePlanWeek.value,
+    execDate: today >= activePlanWeek.value ? today : activePlanWeek.value,
+    priority: 'Normal', isAdhoc, carryOver: false, firstPlanned: activePlanWeek.value,
+    blocker: '', status: 'Not Started', doneDate: '' }
+  const r = await fetch('/api/week-plan', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p) })
+  if (!r.ok) return error.value = `Could not add ${taskID} to the weekly plan`
+  activePlanEntries.value[taskID] = p
+}
+const forgetPlanEntry = taskID => { delete activePlanEntries.value[taskID] }
+const updatePlanEntry = p => { activePlanEntries.value[p.taskID] = { ...p } }
 
 const loginData = ref({
   username: 'rajif',
@@ -230,6 +262,9 @@ const DATE_FIELDS = [
   { key: 'takenAt', label: 'Taken' },
   { key: 'devDoneAt', label: 'Dev Done' },
   { key: 'qaTakenAt', label: 'QA Taken' },
+  { key: 'qaDoneAt', label: 'QA Done' },
+  { key: 'qcTakenAt', label: 'QC Taken' },
+  { key: 'qcDoneAt', label: 'QC Done' },
 ]
 const dateFilter = ref(JSON.parse(localStorage.getItem('task_date_filter') || '{}'))
 const setDateFilter = (field, bound, value) => {
@@ -302,6 +337,27 @@ const updateUserName = async (uid, name) => {
   // optimistic update
   if (!name.trim()) delete userNames.value[uid]
   else userNames.value[uid] = name.trim()
+}
+
+// Pull display names from GET /api/v1/master/users into the local name map.
+// Fills ONLY ids that have no name yet — manual edits are never overwritten.
+// ponytail: persists one-by-one via updateUserName; add a bulk proxy route if
+// the user count ever makes this slow.
+const pullMasterUsers = async () => {
+  const res = await fetch('/api/v1/master/users', {
+    headers: { Authorization: `Bearer ${taskToken.value}` },
+  })
+  if (!res.ok) throw new Error(`Failed to load users (HTTP ${res.status})`)
+  const users = await res.json()
+  let added = 0
+  for (const u of users) {
+    if (!u.id || !u.active || userNames.value[u.id]) continue
+    const name = (u.displayName || u.username || '').trim()
+    if (!name) continue
+    await updateUserName(u.id, name)
+    added++
+  }
+  return { added, total: Array.isArray(users) ? users.length : 0 }
 }
 
 const customTags = ref({})
@@ -393,6 +449,7 @@ const exportToExcel = () => {
   const rows = flatTaskTree.value.map(task => ({
     '#': task._depth,
     STATUS: getEffectiveStatus(task),
+    PRIORITY: getTaskPriority(task),
     ID: task.taskID || task.id,
     TITLE: (task._depth ? '↳ '.repeat(task._depth) : '') + (task.title || ''),
     PRODUCT: task.productCode || task.product || '',
@@ -702,6 +759,11 @@ const getEffectiveStatus = (task) => {
   return task.status
 }
 
+const getTaskPriority = (task) => task.priorityCode || task.priority || ''
+const getPriorityColor = (p) => ({
+  LOW: '#6b7280', MEDIUM: '#3b82f6', HIGH: '#f59e0b', URGENT: '#dc2626',
+}[p] || '#9ca3af')
+
 // old onMounted removed — moved up for version polling
 
 // --- user auth for worklog submissions ---
@@ -770,6 +832,59 @@ const submitWorklog = async (task) => {
     worklogSubmitting.value = false
   }
 }
+
+// --- task detail modal: GET /api/v1/tasks/{id} + /discussion ---
+const detailTaskId = ref(null)
+const detailTask = ref(null)
+const detailDiscussion = ref([])
+const detailLoading = ref(false)
+const detailError = ref('')
+const openDetail = async (id) => {
+  if (!id) return
+  detailTaskId.value = id
+  detailTask.value = taskMap.value[id] || tasks.value.find(t => (t.taskID || t.id) === id) || null
+  detailDiscussion.value = []
+  detailError.value = ''
+  detailLoading.value = true
+  const auth = { 'Authorization': `Bearer ${taskToken.value}` }
+  try {
+    const [taskRes, discRes] = await Promise.all([
+      fetch(`/api/v1/tasks/${encodeURIComponent(id)}`, { headers: auth }),
+      fetch(`/api/v1/tasks/${encodeURIComponent(id)}/discussion?limit=100`, { headers: auth }),
+    ])
+    if (!taskRes.ok) throw new Error(`task HTTP ${taskRes.status}`)
+    // live GET returns the task object directly (description, attachments,
+    // discussionCount top-level); merge so row data survives missing keys.
+    const t = await taskRes.json()
+    if (t && (t.taskID || t.title || t.status)) detailTask.value = { ...detailTask.value, ...t }
+    if (discRes.ok) {
+      const d = await discRes.json()
+      detailDiscussion.value = d.items || []
+    }
+  } catch (err) {
+    detailError.value = err.message
+    // ponytail: keep row data as fallback; live fetch fails only (auth/network).
+  } finally {
+    detailLoading.value = false
+  }
+}
+const closeDetail = () => { detailTaskId.value = null; detailTask.value = null; detailDiscussion.value = []; detailError.value = '' }
+
+// Split text into plain/link segments so URLs in descriptions, notes and
+// discussion messages render clickable. Stdlib regex; no dependency.
+const linkify = (text) => {
+  const parts = []
+  const re = /(https?:\/\/[^\s)]+)/g
+  const s = text || ''
+  let last = 0, m
+  while ((m = re.exec(s))) {
+    if (m.index > last) parts.push({ t: 'text', v: s.slice(last, m.index) })
+    parts.push({ t: 'link', v: m[1] })
+    last = m.index + m[1].length
+  }
+  if (last < s.length) parts.push({ t: 'text', v: s.slice(last) })
+  return parts
+}
 </script>
 
 <template>
@@ -783,6 +898,7 @@ const submitWorklog = async (task) => {
         <button class="nav-tab" :class="{ active: activePage === 'tasks' }" @click="activePage='tasks'">Tasks</button>
         <button class="nav-tab" :class="{ active: activePage === 'stats' }" @click="activePage='stats'">📊 Stats</button>
         <button class="nav-tab" :class="{ active: activePage === 'users' }" @click="activePage='users'">Users</button>
+        <button v-if="userLoginData.username === 'rajif'" class="nav-tab" :class="{ active: activePage === 'plan' }" @click="activePage='plan'">Weekly Plan</button>
       </div>
       <div class="actions" v-if="activePage === 'tasks'">
         <!-- Excel/Sheets-style filter bar -->
@@ -970,7 +1086,8 @@ const submitWorklog = async (task) => {
           <tr>
             <th>Product</th>
             <th>Status</th>
-            <th>ID</th>
+            <th>Priority</th>
+            <th>Parent</th>
             <th>Title</th>
             <th>Ass.</th>
             <th>Reported By</th>
@@ -997,19 +1114,32 @@ const submitWorklog = async (task) => {
               </span>
             </td>
             <td>
-              <a :href="'https://taskmanager.minipc.sismedika.biz.id/tasks/' + (task.taskID || task.id)" target="_blank" class="task-id">
-                {{ task.taskID || task.id }}
-              </a>
+              <span class="badge" :style="{ backgroundColor: getPriorityColor(getTaskPriority(task)) }" v-if="getTaskPriority(task)">
+                {{ getTaskPriority(task) }}
+              </span>
+              <span v-else style="color:#9ca3af">—</span>
+            </td>
+            <td>
+              <button v-if="task.parentTaskID" class="task-id task-id-btn" @click="openDetail(task.parentTaskID)" :title="'Open parent ' + task.parentTaskID">
+                {{ task.parentTaskID }}
+              </button>
             </td>
             <td class="cell-title">
               <div class="scrollable-title" :style="{ paddingLeft: (task._depth * 20) + 'px' }">
-                <a :href="'https://taskmanager.minipc.sismedika.biz.id/tasks/' + (task.taskID || task.id)"
-                   target="_blank" class="task-link"
+                <a class="task-link"
                    :class="{ 'task-link-sub': task._depth > 0 }"
-                   title="Open task in TaskManager">
+                   @click.prevent="openDetail(task.taskID || task.id)"
+                   :title="'Open detail ' + (task.taskID || task.id)">
                   <span v-if="task._depth > 0" class="tree-branch">↳ </span>{{ task.title }}
                 </a>
                 <button class="copy-btn" @click="copyTask(task)" title="Copy ID | Title">📋</button>
+                <template v-if="userLoginData.username === 'rajif'">
+                  <button v-if="!activePlanEntries[task.taskID || task.id]" class="plan-add-btn"
+                          @click="planTask(task, false)" :title="`Add to week of ${activePlanWeek}`">+ Plan</button>
+                  <button v-if="!activePlanEntries[task.taskID || task.id]" class="plan-add-btn plan-adhoc-btn"
+                          @click="planTask(task, true)" :title="`Add as ad-hoc to week of ${activePlanWeek}`">+ Ad-hoc</button>
+                  <span v-else class="planned-pill">Planned</span>
+                </template>
               </div>
             </td>
             <td>
@@ -1047,7 +1177,7 @@ const submitWorklog = async (task) => {
           </tr>
           <!-- inline worklog form row -->
           <tr v-if="worklogTaskId === (task.taskID || task.id)" class="worklog-row">
-            <td colspan="13">
+            <td colspan="14">
               <div class="worklog-inline">
                 <input v-model="worklogForm.description" type="text" placeholder="Description..." class="worklog-input" />
                 <input v-model="worklogForm.date" type="date" class="worklog-input worklog-date" />
@@ -1073,7 +1203,65 @@ const submitWorklog = async (task) => {
     </div>
 
     <div v-if="activePage === 'users'">
-      <UsersPage :tasks="tasks" :user-names="userNames" :update-user-name="updateUserName" />
+      <UsersPage :tasks="tasks" :user-names="userNames" :update-user-name="updateUserName"
+                 :pull-master-users="pullMasterUsers" />
+    </div>
+
+    <div v-if="activePage === 'plan' && userLoginData.username === 'rajif'">
+      <WeeklyPlanPage :tasks="tasks" v-model:active-week="activePlanWeek" :plan-entries="activePlanEntries"
+                      @remove="forgetPlanEntry" @save="updatePlanEntry" />
+    </div>
+  </div>
+
+  <!-- task detail modal: GET /api/v1/tasks/{id} + /discussion -->
+  <div v-if="detailTaskId" class="modal-overlay" @click.self="closeDetail">
+    <div class="modal-box">
+      <div class="modal-head">
+        <div class="modal-title-row">
+          <strong class="modal-title">{{ detailTask?.title || detailTaskId }}</strong>
+          <button class="worklog-cancel" @click="closeDetail">✕</button>
+        </div>
+        <div v-if="detailTask" class="modal-badges">
+          <span class="badge" :style="{ backgroundColor: getStatusColor(getEffectiveStatus(detailTask)) }">{{ getEffectiveStatus(detailTask) }}</span>
+          <span v-if="getTaskPriority(detailTask)" class="badge" :style="{ backgroundColor: getPriorityColor(getTaskPriority(detailTask)) }">{{ getTaskPriority(detailTask) }}</span>
+          <span v-if="detailTask.typeCode" class="modal-chip">{{ detailTask.typeCode }}</span>
+          <span v-if="detailTask.severityCode" class="modal-chip">{{ detailTask.severityCode }}</span>
+          <span class="modal-dim mono">{{ detailTask.taskID || detailTask.id }}</span>
+        </div>
+      </div>
+      <div v-if="detailLoading" class="modal-loading">Loading...</div>
+      <div v-else-if="detailTask" class="modal-body">
+        <div class="modal-chips">
+          <span v-if="detailTask.productCode || detailTask.product" class="modal-chip modal-chip-blue">{{ detailTask.productCode || detailTask.product }}</span>
+          <span v-if="detailTask.moduleCode" class="modal-chip">{{ detailTask.moduleCode }}</span>
+          <span v-if="getUserName(detailTask)" class="modal-chip">👤 {{ getUserName(detailTask) }}</span>
+          <span v-if="detailTask.parentTaskID" class="modal-chip">↳ <button class="task-id task-id-btn" @click="openDetail(detailTask.parentTaskID)">{{ detailTask.parentTaskID }}</button></span>
+          <span class="modal-dim">{{ fmtDate(detailTask.reportedAt) }} → {{ fmtDate(detailTask.qaDoneAt || detailTask.devDoneAt || detailTask.takenAt) || 'open' }}</span>
+        </div>
+        <div v-if="detailTask.description" class="modal-sec"><div class="modal-sec-title">Description</div><div class="modal-text"><template v-for="(p, i) in linkify(detailTask.description)" :key="i"><a v-if="p.t === 'link'" :href="p.v" target="_blank" class="task-id">{{ p.v }}</a><template v-else>{{ p.v }}</template></template></div></div>
+        <div v-if="detailTask.notes" class="modal-sec"><div class="modal-sec-title">Notes</div><div class="modal-text"><template v-for="(p, i) in linkify(detailTask.notes)" :key="i"><a v-if="p.t === 'link'" :href="p.v" target="_blank" class="task-id">{{ p.v }}</a><template v-else>{{ p.v }}</template></template></div></div>
+        <div v-if="detailTask.attachments?.length" class="modal-sec"><div class="modal-sec-title">Attachments ({{ detailTask.attachments.length }})</div>
+          <ul class="modal-list">
+            <li v-for="a in detailTask.attachments" :key="a.ID || a.Filename">{{ a.DisplayName || a.Filename }} <span class="modal-dim">{{ a.MIMEType }} · {{ (a.SizeBytes / 1024).toFixed(1) }} KB</span></li>
+          </ul>
+        </div>
+        <div v-if="detailTask.tags?.length || detailTask.links?.length || detailTask.jamURLs?.length" class="modal-sec"><div class="modal-sec-title">Links</div>
+          <ul class="modal-list">
+            <li v-for="t in (detailTask.tags || [])" :key="t">{{ t }}</li>
+            <li v-for="l in (detailTask.links || [])" :key="l"><a :href="l" target="_blank" class="task-id">{{ l }}</a></li>
+            <li v-for="j in (detailTask.jamURLs || [])" :key="j"><a :href="j" target="_blank" class="task-id">🎥 {{ j }}</a></li>
+          </ul>
+        </div>
+        <div v-if="detailDiscussion.length" class="modal-sec"><div class="modal-sec-title">Discussion ({{ detailDiscussion.length }})</div>
+          <div v-for="m in detailDiscussion" :key="m.id" class="modal-msg">
+            <div class="modal-msg-head"><strong>{{ m.authorDisplayName || m.authorUsername }}</strong><span class="modal-dim">{{ fmtDate(m.createdAt) }}</span></div>
+            <div><template v-for="(p, i) in linkify(m.text)" :key="i"><a v-if="p.t === 'link'" :href="p.v" target="_blank" class="task-id">{{ p.v }}</a><template v-else>{{ p.v }}</template></template></div>
+          </div>
+        </div>
+        <div v-else-if="detailTask.discussionCount" class="modal-dim">{{ detailTask.discussionCount }} discussion messages (could not load).</div>
+        <div v-if="detailError" class="worklog-msg err">Live fetch failed ({{ detailError }}) — showing row data.</div>
+        <a :href="'https://taskmanager.minipc.sismedika.biz.id/tasks/' + detailTaskId" target="_blank" class="task-id">Open in TaskManager ↗</a>
+      </div>
     </div>
   </div>
 </template>
@@ -1417,16 +1605,106 @@ input {
   min-width: 90px;
 }
 
-.task-id { 
-  font-family: monospace; 
-  color: #2563eb; 
-  font-size: 0.85rem; 
+.task-id {
+  font-family: monospace;
+  color: #2563eb;
+  font-size: 0.85rem;
   text-decoration: none;
 }
 .task-id:hover { text-decoration: underline; }
+.task-id-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font-weight: 400;
+}
 
-/* Title cell: the whole title is now the link to the task */
-.task-link { color: #111827; text-decoration: none; }
+/* --- task detail modal --- */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+.modal-box {
+  background: white;
+  border-radius: 8px;
+  max-width: 560px;
+  width: 100%;
+  max-height: 85vh;
+  overflow-y: auto;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.25);
+}
+.modal-head {
+  padding: 16px 18px 12px;
+  border-bottom: 1px solid #e5e7eb;
+  position: sticky;
+  top: 0;
+  background: white;
+}
+.modal-title-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.modal-title { font-size: 1rem; line-height: 1.4; }
+.modal-badges { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 8px; }
+.modal-badges .badge { min-width: 0; }
+.modal-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.modal-chip {
+  font-size: 0.72rem;
+  font-weight: 500;
+  color: #4b5563;
+  background: #f3f4f6;
+  border: 1px solid #e5e7eb;
+  padding: 2px 8px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.modal-chip-blue { color: #1d4ed8; background: #dbeafe; border-color: #bfdbfe; }
+.modal-sec-title { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: #9ca3af; margin-bottom: 4px; }
+.modal-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 0.82rem;
+  line-height: 1.55;
+}
+.modal-text .task-id, .modal-msg .task-id { word-break: break-all; }
+.modal-body { padding: 14px 18px; display: flex; flex-direction: column; gap: 12px; }
+.modal-loading { padding: 24px; text-align: center; color: #6b7280; }
+.modal-grid {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  gap: 6px 12px;
+  font-size: 0.82rem;
+}
+.modal-grid > span:nth-child(odd) { color: #6b7280; font-weight: 500; }
+.modal-grid .mono { font-family: monospace; }
+.modal-dim { color: #9ca3af; font-size: 0.75rem; }
+.modal-list { margin: 4px 0 0; padding-left: 18px; font-size: 0.78rem; }
+.modal-list li { margin: 2px 0; word-break: break-all; }
+.modal-msg { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 4px; padding: 6px 10px; margin-top: 6px; font-size: 0.78rem; white-space: pre-wrap; }
+.modal-msg-head { display: flex; gap: 8px; align-items: baseline; margin-bottom: 2px; }
+.modal-sec { font-size: 0.82rem; }
+.modal-sec pre {
+  white-space: pre-wrap;
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin: 4px 0 0;
+  font-size: 0.78rem;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+/* Title cell: the title opens the detail modal */
+.task-link { color: #111827; text-decoration: none; cursor: pointer; }
 .task-link:hover { color: #2563eb; text-decoration: underline; }
 .task-link-sub { color: #374151; }
 
@@ -1464,6 +1742,16 @@ input {
 }
 .scrollable-title:hover .copy-btn { opacity: 1; }
 .copy-btn:hover { background: #e5e7eb; }
+.plan-add-btn, .planned-pill {
+  margin-left: 6px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+.plan-add-btn { background: #2563eb; color: white; }
+.plan-adhoc-btn { background: #b45309; }
+.planned-pill { background: #dcfce7; color: #166534; }
 
 .tree-branch { color: #9ca3af; margin-right: 4px; }
 

@@ -21,6 +21,19 @@ db.run(`CREATE TABLE IF NOT EXISTS task_tags (
   devDoneDate TEXT NOT NULL DEFAULT '',
   sprint TEXT NOT NULL DEFAULT ''
 )`)
+db.run(`CREATE TABLE IF NOT EXISTS week_plan_entries (
+  taskID TEXT NOT NULL,
+  week TEXT NOT NULL,
+  execDate TEXT NOT NULL DEFAULT '',
+  priority TEXT NOT NULL DEFAULT '',
+  isAdhoc INTEGER NOT NULL DEFAULT 0,
+  carryOver INTEGER NOT NULL DEFAULT 0,
+  firstPlanned TEXT NOT NULL DEFAULT '',
+  blocker TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'PLANNED',
+  doneDate TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (week, taskID)
+)`)
 
 const app = express()
 
@@ -78,14 +91,44 @@ app.get('/api/user-names', (_req, res) => {
 app.put('/api/user-names/:uid', express.json(), (req, res) => {
   const { uid } = req.params
   const { name } = req.body || {}
-  if (!name || !name.trim()) {
-    db.run('DELETE FROM user_names WHERE uid = ?', [uid])
-  } else {
-    db.run(
-      'INSERT INTO user_names (uid, name) VALUES (?, ?) ON CONFLICT(uid) DO UPDATE SET name = excluded.name',
-      [uid, name.trim()],
-    )
+  if (!name || !name.trim()) db.run('DELETE FROM user_names WHERE uid = ?', [uid])
+  else db.run(
+    'INSERT INTO user_names (uid, name) VALUES (?, ?) ON CONFLICT(uid) DO UPDATE SET name = excluded.name',
+    [uid, name.trim()],
+  )
+  res.json({ ok: true })
+})
+
+// --- weekly plan: private local metadata, access is additionally UI-gated to rajif ---
+app.get('/api/week-plan', (req, res) => {
+  const week = String(req.query.week || '')
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(week)) return res.status(400).json({ error: 'week (YYYY-MM-DD) required' })
+  const rows = db.query('SELECT * FROM week_plan_entries WHERE week = ? ORDER BY execDate, taskID').all(week)
+  res.json(Object.fromEntries(rows.map(r => [r.taskID, {
+    ...r, isAdhoc: !!r.isAdhoc, carryOver: !!r.carryOver,
+  }])))
+})
+
+app.put('/api/week-plan', express.json(), (req, res) => {
+  const b = req.body || {}
+  if (!b.taskID || !/^\d{4}-\d{2}-\d{2}$/.test(b.week || '')) {
+    return res.status(400).json({ error: 'taskID and week (YYYY-MM-DD) required' })
   }
+  const text = key => String(b[key] || '').trim()
+  db.run(`INSERT INTO week_plan_entries (taskID, week, execDate, priority, isAdhoc, carryOver, firstPlanned, blocker, status, doneDate)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(week, taskID) DO UPDATE SET execDate=excluded.execDate,
+    priority=excluded.priority, isAdhoc=excluded.isAdhoc, carryOver=excluded.carryOver,
+    firstPlanned=excluded.firstPlanned, blocker=excluded.blocker, status=excluded.status, doneDate=excluded.doneDate`,
+    [text('taskID'), text('week'), text('execDate'), text('priority'), b.isAdhoc ? 1 : 0,
+      b.carryOver ? 1 : 0, text('firstPlanned'), text('blocker'), text('status') || 'PLANNED', text('doneDate')])
+  res.json({ ok: true })
+})
+
+app.delete('/api/week-plan/:taskID', (req, res) => {
+  const week = String(req.query.week || '')
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(week)) return res.status(400).json({ error: 'week (YYYY-MM-DD) required' })
+  db.run('DELETE FROM week_plan_entries WHERE taskID = ? AND week = ?', [req.params.taskID, week])
   res.json({ ok: true })
 })
 
