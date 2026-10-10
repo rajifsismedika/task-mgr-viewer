@@ -16,6 +16,7 @@ onMounted(async () => {
   await loadCustomTags()
   if (taskToken.value) {
     await fetchProducts()
+    await loadMasterUserList()
     // no auto-select: tasks load only for products chosen in the Product filter
     if (selectedProducts.value.length) fetchTasks()
   }
@@ -463,21 +464,8 @@ const exportToExcel = () => {
     'QA TAKEN': fmtDate(task.qaTakenAt)
   }))
   // Build TSV (tab-separated) — pastes cleanly into Excel
-  const headers = Object.keys(rows[0] || {})
-  const esc = v => String(v ?? '').replace(/\t/g, ' ').replace(/\n/g, ' ')
-  const tsv = [headers.join('\t'), ...rows.map(r => headers.map(h => esc(r[h])).join('\t'))].join('\n')
-  const blob = new Blob([tsv], { type: 'text/tab-separated-values;charset=utf-8' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
   const product = selectedProducts.value.join('_') || 'all'
-  const d = new Date()
-  const stamp = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`
-  a.href = url
-  a.download = `tasks_${product}_${stamp}.tsv`
-  document.body.appendChild(a)
-  a.click()
-  document.body.removeChild(a)
-  URL.revokeObjectURL(url)
+  downloadTsv(rows, `tasks_${product}`)
 }
 
 const toggleStatus = (status) => {
@@ -766,14 +754,60 @@ const getPriorityColor = (p) => ({
 
 // old onMounted removed — moved up for version polling
 
-// --- user auth for worklog submissions ---
+// --- actor auth (👤 Taskmanager bar): login stores user detail + actor token.
+// Reads (products/tasks) stay on the shared rajif taskToken; mutations
+// (take/dev-done/assignments/notes) use the actor's own token + user id.
+const actorUser = ref(JSON.parse(localStorage.getItem('task_actor') || 'null'))
+const actorToken = ref(localStorage.getItem('task_actor_token') || '')
+const actorLoading = ref(false)
+const masterUsers = ref([])
 const userLoginData = ref(JSON.parse(localStorage.getItem('user_credentials') || 'null') || { username: '', password: '' })
 const userLoginError = ref('')
 
-// auto-save credentials to localStorage on change
-watch(userLoginData, (v) => {
-  localStorage.setItem('user_credentials', JSON.stringify(v))
-}, { deep: true })
+const loginActor = async (silent) => {
+  if (!userLoginData.value.username || !userLoginData.value.password) {
+    if (!silent) userLoginError.value = 'Enter username + password'
+    return
+  }
+  actorLoading.value = true
+  userLoginError.value = ''
+  try {
+    const res = await fetch('/api/v1/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(userLoginData.value),
+    })
+    if (!res.ok) throw new Error(`Login failed (HTTP ${res.status})`)
+    const data = await res.json()
+    actorUser.value = data.user
+    actorToken.value = data.accessToken
+    localStorage.setItem('task_actor', JSON.stringify(data.user))
+    localStorage.setItem('task_actor_token', data.accessToken)
+    localStorage.setItem('user_credentials', JSON.stringify(userLoginData.value))
+  } catch (err) {
+    if (!silent) userLoginError.value = err.message
+  } finally {
+    actorLoading.value = false
+  }
+}
+const logoutActor = () => {
+  actorUser.value = null
+  actorToken.value = ''
+  localStorage.removeItem('task_actor')
+  localStorage.removeItem('task_actor_token')
+}
+
+// Active master users for the assign-target dropdown (reads use taskToken).
+const loadMasterUserList = async () => {
+  try {
+    const res = await fetch('/api/v1/master/users', {
+      headers: { Authorization: `Bearer ${taskToken.value}` },
+    })
+    if (!res.ok) return
+    const u = await res.json()
+    masterUsers.value = (Array.isArray(u) ? u : (u.items || [])).filter(x => x.active)
+  } catch { /* ignore */ }
+}
 
 // --- worklog inline form ---
 const worklogTaskId = ref(null)
@@ -868,7 +902,340 @@ const openDetail = async (id) => {
     detailLoading.value = false
   }
 }
-const closeDetail = () => { detailTaskId.value = null; detailTask.value = null; detailDiscussion.value = []; detailError.value = '' }
+const closeDetail = () => { detailTaskId.value = null; detailTask.value = null; detailDiscussion.value = []; detailError.value = ''; detailActionMsg.value = ''; detailNoteText.value = ''; detailAssignUser.value = ''; detailAssignQuery.value = '' }
+
+// --- task actions (actor token + actor user id; reads stay on rajif taskToken) ---
+const detailActionMsg = ref('')
+const detailActionBusy = ref('')
+const detailNoteText = ref('')
+const detailAssignUser = ref('')
+// Searchable assign box: user types a name (or pastes a UID); the list shows
+// matches and the pick resolves to a UID. Free text never reaches the API.
+const detailAssignQuery = ref('')
+const assignCandidates = computed(() => {
+  const q = detailAssignQuery.value.trim().toLowerCase()
+  if (!q) return masterUsers.value.slice(0, 30)
+  return masterUsers.value.filter(u =>
+    (u.displayName || u.username || '').toLowerCase().includes(q) || (u.id || '').toLowerCase().includes(q)
+  ).slice(0, 30)
+})
+const resolveAssignUser = () => {
+  const q = detailAssignQuery.value.trim().toLowerCase()
+  if (!q) { detailAssignUser.value = ''; return }
+  // exact UID paste wins; otherwise unique name/username match
+  const byId = masterUsers.value.find(u => (u.id || '').toLowerCase() === q)
+  if (byId) { detailAssignUser.value = byId.id; return }
+  const hits = masterUsers.value.filter(u =>
+    (u.displayName || u.username || '').toLowerCase() === q || (u.username || '').toLowerCase() === q)
+  detailAssignUser.value = hits.length === 1 ? hits[0].id : ''
+}
+const actorHeaders = () => ({ 'Authorization': `Bearer ${actorToken.value}`, 'Content-Type': 'application/json' })
+const needActor = () => {
+  if (!actorUser.value || !actorToken.value) {
+    detailActionMsg.value = 'Log in as actor first (👤 bar above)'
+    return false
+  }
+  return true
+}
+// Merge RoutineTaskResponse summary into row + open modal, then refresh list.
+const applyTaskSummary = async (id, summary) => {
+  const i = tasks.value.findIndex(t => (t.taskID || t.id) === id)
+  if (i !== -1 && summary && (summary.taskID || summary.status)) tasks.value[i] = { ...tasks.value[i], ...summary }
+  await openDetail(id)
+  await fetchTasks()
+}
+const takeTask = async () => {
+  if (!needActor()) return
+  detailActionBusy.value = 'take'
+  detailActionMsg.value = ''
+  try {
+    const res = await fetch(`/api/v1/tasks/${encodeURIComponent(detailTaskId.value)}/take`, {
+      method: 'POST', headers: actorHeaders(),
+      body: JSON.stringify({ actorUserID: actorUser.value.id }),
+    })
+    if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`)
+    detailActionMsg.value = '✓ Taken'
+    await applyTaskSummary(detailTaskId.value, await res.json())
+  } catch (err) { detailActionMsg.value = err.message }
+  finally { detailActionBusy.value = '' }
+}
+const devDoneTask = async () => {
+  if (!needActor()) return
+  detailActionBusy.value = 'devdone'
+  detailActionMsg.value = ''
+  try {
+    const res = await fetch(`/api/v1/tasks/${encodeURIComponent(detailTaskId.value)}/dev-done`, {
+      method: 'POST', headers: actorHeaders(),
+      body: JSON.stringify({ actorUserID: actorUser.value.id }),
+    })
+    if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`)
+    detailActionMsg.value = '✓ Dev done'
+    await applyTaskSummary(detailTaskId.value, await res.json())
+  } catch (err) { detailActionMsg.value = err.message }
+  finally { detailActionBusy.value = '' }
+}
+const assignTask = async () => {
+  if (!needActor()) return
+  if (userLoginData.value.username !== 'rajif') { detailActionMsg.value = 'Only rajif can assign tasks'; return }
+  resolveAssignUser()
+  if (!detailAssignUser.value) { detailActionMsg.value = 'Pick a user from the list'; return }
+  detailActionBusy.value = 'assign'
+  detailActionMsg.value = ''
+  try {
+    const res = await fetch(`/api/v1/tasks/${encodeURIComponent(detailTaskId.value)}/assignments`, {
+      method: 'POST', headers: actorHeaders(),
+      body: JSON.stringify({ actorUserID: actorUser.value.id, mode: 'reassign', targetUserID: detailAssignUser.value }),
+    })
+    if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`)
+    detailActionMsg.value = '✓ Reassigned'
+    await applyTaskSummary(detailTaskId.value, await res.json())
+  } catch (err) { detailActionMsg.value = err.message }
+  finally { detailActionBusy.value = '' }
+}
+const postNote = async () => {
+  if (!needActor()) return
+  const note = detailNoteText.value.trim()
+  if (!note) { detailActionMsg.value = 'Note is empty'; return }
+  detailActionBusy.value = 'note'
+  detailActionMsg.value = ''
+  try {
+    const res = await fetch(`/api/v1/tasks/${encodeURIComponent(detailTaskId.value)}/notes`, {
+      method: 'POST', headers: actorHeaders(),
+      body: JSON.stringify({ note }),
+    })
+    if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`)
+    detailNoteText.value = ''
+    detailActionMsg.value = '✓ Note added'
+    await openDetail(detailTaskId.value)
+  } catch (err) { detailActionMsg.value = err.message }
+  finally { detailActionBusy.value = '' }
+}
+
+// --- quick row actions (claim / dev-done straight from the table) ---
+const rowBusy = ref({})
+const rowMsg = ref({ id: null, ok: false, text: '' })
+const refreshRow = (id, summary) => {
+  const i = tasks.value.findIndex(t => (t.taskID || t.id) === id)
+  if (i !== -1 && summary && (summary.taskID || summary.status)) tasks.value[i] = { ...tasks.value[i], ...summary }
+}
+const quickAction = async (task, action) => {
+  const id = task.taskID || task.id
+  if (!actorUser.value || !actorToken.value) {
+    rowMsg.value = { id, ok: false, text: 'Login as actor (👤 bar above) first' }
+    return
+  }
+  rowBusy.value[id] = action
+  rowMsg.value = { id, ok: false, text: '' }
+  try {
+    const res = await fetch(`/api/v1/tasks/${encodeURIComponent(id)}/${action}`, {
+      method: 'POST', headers: actorHeaders(),
+      body: JSON.stringify({ actorUserID: actorUser.value.id }),
+    })
+    if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`)
+    rowMsg.value = { id, ok: true, text: action === 'take' ? '✓ Taken' : '✓ Dev done' }
+    refreshRow(id, await res.json())
+    setTimeout(() => { if (rowMsg.value.id === id) rowMsg.value = { id: null, ok: false, text: '' } }, 3000)
+  } catch (err) {
+    rowMsg.value = { id, ok: false, text: err.message }
+  } finally {
+    delete rowBusy.value[id]
+  }
+}
+
+// --- create task (POST /api/v1/tasks as the logged-in actor) ---
+const createOpen = ref(false)
+const createBusy = ref(false)
+const createMsg = ref('')
+const createForm = ref({ title: '', description: '', productCode: '', moduleCode: '', typeCode: 'TASK', severityCode: '', priorityCode: 'NORMAL', parentTaskID: '' })
+const masterModules = ref([])
+const loadModules = async () => {
+  try {
+    const res = await fetch('/api/v1/master/modules', {
+      headers: { Authorization: `Bearer ${taskToken.value}` },
+    })
+    if (!res.ok) return
+    const m = await res.json()
+    masterModules.value = (Array.isArray(m) ? m : (m.items || [])).filter(x => x.active !== false)
+  } catch { /* ignore */ }
+}
+const createModules = computed(() => masterModules.value.filter(m => m.productCode === createForm.value.productCode))
+// Searchable pickers for the create form: type to filter, click to choose.
+// The chosen code is stored; the query line is display-only.
+const createPick = ref({ product: '', module: '' })
+const createProductHits = computed(() => {
+  const q = createPick.value.product.trim().toLowerCase()
+  const list = products.value.map(p => ({ code: p.code || p.productCode || p.name, name: p.name || '' }))
+  return (q ? list.filter(p => p.code.toLowerCase().includes(q) || p.name.toLowerCase().includes(q)) : list).slice(0, 40)
+})
+const createModuleHits = computed(() => {
+  const q = createPick.value.module.trim().toLowerCase()
+  const list = createModules.value.map(m => ({ code: m.code, name: m.name || '' }))
+  return (q ? list.filter(m => m.code.toLowerCase().includes(q) || m.name.toLowerCase().includes(q)) : list).slice(0, 40)
+})
+const pickCreateProduct = (code) => {
+  createForm.value.productCode = code
+  createPick.value.product = code
+  createPick.value.module = ''
+  onCreateProductChange()
+}
+const pickCreateModule = (code) => {
+  createForm.value.moduleCode = code
+  createPick.value.module = code
+}
+const openCreate = () => {
+  createMsg.value = ''
+  createForm.value = {
+    title: '', description: '',
+    productCode: selectedProducts.value.length === 1 ? selectedProducts.value[0] : '',
+    moduleCode: '', typeCode: 'TASK', severityCode: '', priorityCode: 'NORMAL', parentTaskID: '',
+  }
+  createPick.value = { product: createForm.value.productCode, module: '' }
+  if (createForm.value.productCode) onCreateProductChange()
+  createOpen.value = true
+  if (!masterModules.value.length) loadModules()
+}
+// open the create modal as a sub-task of the given parent task
+const openCreateFor = (parentId) => {
+  const parent = taskMap.value[parentId] || tasks.value.find(t => (t.taskID || t.id) === parentId)
+  if (parent?.parentTaskID) {
+    // defense-in-depth: the Sub-task button is hidden for sub-tasks anyway
+    rowMsg.value = { id: parentId, ok: false, text: 'Cannot nest sub-tasks' }
+    return
+  }
+  openCreate()
+  createForm.value.parentTaskID = parentId || ''
+}
+const onCreateProductChange = () => {
+  const prod = createForm.value.productCode
+  const p = products.value.find(x => (x.code || x.productCode) === prod)
+  createForm.value.moduleCode = p?.defaultModuleCode || (createModules.value[0]?.code || '')
+}
+const submitCreate = async () => {
+  if (userLoginData.value.username !== 'rajif') { createMsg.value = 'Only rajif can create tasks'; return }
+  if (!actorUser.value || !actorToken.value) { createMsg.value = 'Login as actor (👤 bar above) first'; return }
+  const f = createForm.value
+  if (!f.title.trim()) { createMsg.value = 'Title is required'; return }
+  if (!f.productCode) { createMsg.value = 'Pick a product'; return }
+  if (!f.moduleCode) { createMsg.value = 'Pick a module'; return }
+  if (f.parentTaskID.trim()) {
+    const parent = taskMap.value[f.parentTaskID.trim()] || tasks.value.find(t => (t.taskID || t.id) === f.parentTaskID.trim())
+    if (parent?.parentTaskID) { createMsg.value = 'Sub-tasks cannot be nested'; return }
+  }
+  createBusy.value = true
+  createMsg.value = ''
+  try {
+    const body = {
+      title: f.title.trim(),
+      description: f.description.trim(),
+      productCode: f.productCode,
+      moduleCode: f.moduleCode,
+      typeCode: (f.typeCode || 'TASK').trim().toUpperCase(),
+      priorityCode: (f.priorityCode || 'NORMAL').trim().toUpperCase(),
+    }
+    if (f.severityCode.trim()) body.severityCode = f.severityCode.trim().toUpperCase()
+    if (f.parentTaskID.trim()) body.parentTaskID = f.parentTaskID.trim()
+    const res = await fetch('/api/v1/tasks', {
+      method: 'POST', headers: actorHeaders(), body: JSON.stringify(body),
+    })
+    if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`)
+    const created = await res.json()
+    createMsg.value = `✓ Created ${created.taskID || ''}`
+    createOpen.value = false
+    // make sure the new task is visible: select its product if not loaded
+    if (!selectedProducts.value.includes(f.productCode)) toggleProductFilter(f.productCode)
+    else await fetchTasks()
+  } catch (err) {
+    createMsg.value = err.message
+  } finally {
+    createBusy.value = false
+  }
+}
+
+// --- download ALL tasks (every product, every page, all statuses) ---
+const downloadAllBusy = ref(false)
+const downloadTsv = (rows, baseName) => {
+  const headers = Object.keys(rows[0] || {})
+  const esc = v => String(v ?? '').replace(/\t/g, ' ').replace(/\n/g, ' ')
+  const tsv = [headers.join('\t'), ...rows.map(r => headers.map(h => esc(r[h])).join('\t'))].join('\n')
+  const blob = new Blob([tsv], { type: 'text/tab-separated-values;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const d = new Date()
+  const stamp = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${baseName}_${stamp}.tsv`
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+const downloadAllTasks = async () => {
+  if (!taskToken.value) return loginAndFetch()
+  downloadAllBusy.value = true
+  try {
+    if (!products.value.length) await fetchProducts()
+    const prods = products.value.map(p => p.code || p.productCode || p.name).filter(Boolean)
+    if (!prods.length) throw new Error('No products available')
+    const pageSize = 100 // API hard limit
+    const seen = new Set()
+    const all = []
+    const prevStatus = fetchStatus.value
+    for (const product of prods) {
+      let page = 1
+      let productCount = 0
+      while (true) {
+        fetchStatus.value = `Downloading ${product} (page ${page})...`
+        const res = await fetch(`/api/v1/tasks?pageSize=${pageSize}&page=${page}&includeArchived=true&product=${encodeURIComponent(product)}`, {
+          headers: { Authorization: `Bearer ${taskToken.value}` },
+        })
+        if (!res.ok) break // skip failing product rather than aborting the whole export
+        const data = await res.json()
+        const items = data.items || []
+        for (const it of items) {
+          const id = it.taskID || it.id
+          if (id && !seen.has(id)) { seen.add(id); all.push(it) }
+        }
+        productCount += items.length
+        if (items.length < pageSize || productCount >= (data.total || 0)) break
+        page++
+      }
+    }
+    fetchStatus.value = prevStatus
+    if (!all.length) throw new Error('No tasks found')
+    const rows = all.map(t => ({
+      ID: t.taskID || t.id,
+      PARENT: t.parentTaskID || '',
+      STATUS: getEffectiveStatus(t),
+      PRIORITY: getTaskPriority(t),
+      SEVERITY: t.severityCode || '',
+      TYPE: t.typeCode || '',
+      PRODUCT: t.productCode || '',
+      MODULE: t.moduleCode || '',
+      TITLE: t.title || '',
+      DESCRIPTION: t.description || '',
+      ASSIGNEE: getUserName(t),
+      'REPORTED BY': t.reportedByDisplayName || userName(t.reportedByUserID),
+      REPORTED: fmtDate(t.reportedAt),
+      TAKEN: fmtDate(t.takenAt),
+      'TAKEN BY': userName(t.takenByUserID),
+      'DEV DONE': fmtDate(t.devDoneAt),
+      'QA BY': userName(t.qaTakenByUserID),
+      'QA TAKEN': fmtDate(t.qaTakenAt),
+      'QA DONE': fmtDate(t.qaDoneAt),
+      'QC TAKEN': fmtDate(t.qcTakenAt),
+      'QC DONE': fmtDate(t.qcDoneAt),
+      UPDATED: fmtDate(t.updatedAt),
+      'ON HOLD': t.isOnHold ? 'Yes' : '',
+      SUPPORT: t.isSupport ? 'Yes' : '',
+      ADHOC: t.isAdHoc ? 'Yes' : '',
+    }))
+    downloadTsv(rows, 'tasks_all')
+  } catch (err) {
+    error.value = err.message
+  } finally {
+    downloadAllBusy.value = false
+  }
+}
 
 // Split text into plain/link segments so URLs in descriptions, notes and
 // discussion messages render clickable. Stdlib regex; no dependency.
@@ -1048,8 +1415,12 @@ const linkify = (text) => {
           <button class="filter-chip status-bulk" style="margin-left:6px;" @click="setAllStatuses(true)">Hide All</button>
           <button class="filter-chip status-bulk" @click="setAllStatuses(false)">Show All</button>
         </div>
-        <div style="display: flex; gap: 15px; align-items: center;">
+        <div style="display: flex; gap: 15px; align-items: center; flex-wrap: wrap;">
+          <button v-if="userLoginData.username === 'rajif'" @click="openCreate" title="Create a new task (POST /api/v1/tasks as the logged-in actor — rajif only)" class="create-btn">＋ New Task</button>
           <button @click="exportToExcel" title="Download current view as TSV (opens in Excel)" class="export-btn">📊 Export Excel</button>
+          <button @click="downloadAllTasks" :disabled="downloadAllBusy" title="Download ALL tasks across every product (all statuses, archived included)" class="export-btn download-all-btn">
+            {{ downloadAllBusy ? 'Downloading…' : '⬇ All Tasks' }}
+          </button>
           <button @click="fetchTasks()" :disabled="loading">
             {{ loading ? 'Refreshing...' : 'Refresh Tasks' }}
           </button>
@@ -1058,8 +1429,15 @@ const linkify = (text) => {
         </div>
         <div class="user-auth-bar" v-if="activePage === 'tasks'">
           <span class="user-auth-label">👤 Taskmanager</span>
-          <input v-model="userLoginData.username" type="text" placeholder="Username" class="user-auth-input" />
-          <input v-model="userLoginData.password" type="password" placeholder="Password" class="user-auth-input" />
+          <template v-if="actorUser">
+            <span class="modal-chip modal-chip-blue">{{ actorUser.displayName || actorUser.username }}</span>
+            <button class="user-auth-btn" @click="logoutActor">Logout</button>
+          </template>
+          <template v-else>
+            <input v-model="userLoginData.username" type="text" placeholder="Username" class="user-auth-input" @keydown.enter="loginActor()" />
+            <input v-model="userLoginData.password" type="password" placeholder="Password" class="user-auth-input" @keydown.enter="loginActor()" />
+            <button class="user-auth-btn" @click="loginActor()" :disabled="actorLoading">{{ actorLoading ? '...' : 'Login' }}</button>
+          </template>
           <span v-if="userLoginError" class="worklog-msg err">{{ userLoginError }}</span>
         </div>
       </div>
@@ -1097,7 +1475,7 @@ const linkify = (text) => {
             <th>Dev Done</th>
             <th>QA By</th>
             <th>QA Taken</th>
-            <th class="center">Work</th>
+            <th class="center actions-col">Work</th>
           </tr>
         </thead>
         <tbody>
@@ -1167,12 +1545,23 @@ const linkify = (text) => {
             <td class="cell-date">{{ fmtDate(task.devDoneAt) }}</td>
             <td class="cell-user">{{ userName(task.qaTakenByUserID) }}</td>
             <td class="cell-date">{{ fmtDate(task.qaTakenAt) }}</td>
-            <td class="center">
-              <button class="worklog-btn" @click="toggleWorklog(task)"
-                      :class="{ active: worklogTaskId === (task.taskID || task.id) }"
-                      title="Log work">
-                ⏱
-              </button>
+            <td class="center actions-col">
+              <span class="row-actions">
+                <button v-if="getEffectiveStatus(task) === 'REPORTED'" class="worklog-btn row-take-btn"
+                        @click="quickAction(task, 'take')" :disabled="rowBusy[task.taskID || task.id]"
+                        title="Claim this task (POST /take as logged-in actor)">⬇</button>
+                <button v-if="getEffectiveStatus(task) === 'IN_DEV'" class="worklog-btn row-done-btn"
+                        @click="quickAction(task, 'dev-done')" :disabled="rowBusy[task.taskID || task.id]"
+                        title="Mark dev done (POST /dev-done as logged-in actor)">✓</button>
+                <button class="worklog-btn" @click="toggleWorklog(task)"
+                        :class="{ active: worklogTaskId === (task.taskID || task.id) }"
+                        title="Log work">
+                  ⏱
+                </button>
+              </span>
+              <span v-if="rowMsg.id === (task.taskID || task.id)" class="worklog-msg" :class="{ ok: rowMsg.ok, err: !rowMsg.ok }">
+                {{ rowMsg.text }}
+              </span>
             </td>
           </tr>
           <!-- inline worklog form row -->
@@ -1238,6 +1627,30 @@ const linkify = (text) => {
           <span v-if="detailTask.parentTaskID" class="modal-chip">↳ <button class="task-id task-id-btn" @click="openDetail(detailTask.parentTaskID)">{{ detailTask.parentTaskID }}</button></span>
           <span class="modal-dim">{{ fmtDate(detailTask.reportedAt) }} → {{ fmtDate(detailTask.qaDoneAt || detailTask.devDoneAt || detailTask.takenAt) || 'open' }}</span>
         </div>
+        <div v-if="actorUser" class="modal-actions">
+          <button class="action-btn" @click="takeTask" :disabled="detailActionBusy" title="Claim task (POST /take)">⬇ Take</button>
+          <button class="action-btn" @click="devDoneTask" :disabled="detailActionBusy" title="Mark dev done (POST /dev-done)">✓ Dev Done</button>
+          <template v-if="userLoginData.username === 'rajif'">
+            <span class="assign-search-wrap">
+              <input v-model="detailAssignQuery" @input="resolveAssignUser" type="text"
+                     placeholder="Search user to assign…" class="action-select assign-search" />
+              <div v-if="detailAssignQuery && assignCandidates.length" class="assign-popup">
+                <button v-for="u in assignCandidates" :key="u.id" type="button" class="assign-option"
+                        @click="detailAssignQuery = u.displayName || u.username; resolveAssignUser()">
+                  {{ u.displayName || u.username }}
+                  <span class="modal-dim">{{ u.role || '' }}</span>
+                </button>
+              </div>
+            </span>
+            <button class="action-btn" @click="assignTask" :disabled="detailActionBusy || !detailAssignUser"
+                    :title="detailAssignUser ? 'Assign to ' + detailAssignUser : 'Type and pick a user (POST /assignments as reassign)'">↔ Assign</button>
+          </template>
+        </div>
+        <div v-if="actorUser" class="modal-note-row">
+          <input v-model="detailNoteText" type="text" placeholder="Add a note… (POST /notes)" class="modal-note-input" @keydown.enter="postNote" />
+          <button class="action-btn" @click="postNote" :disabled="detailActionBusy || !detailNoteText.trim()">+ Note</button>
+        </div>
+        <div v-if="detailActionMsg" class="worklog-msg" :class="{ err: !detailActionMsg.startsWith('✓') }">{{ detailActionBusy ? '…' : '' }}{{ detailActionMsg }}</div>
         <div v-if="detailTask.description" class="modal-sec"><div class="modal-sec-title">Description</div><div class="modal-text"><template v-for="(p, i) in linkify(detailTask.description)" :key="i"><a v-if="p.t === 'link'" :href="p.v" target="_blank" class="task-id">{{ p.v }}</a><template v-else>{{ p.v }}</template></template></div></div>
         <div v-if="detailTask.notes" class="modal-sec"><div class="modal-sec-title">Notes</div><div class="modal-text"><template v-for="(p, i) in linkify(detailTask.notes)" :key="i"><a v-if="p.t === 'link'" :href="p.v" target="_blank" class="task-id">{{ p.v }}</a><template v-else>{{ p.v }}</template></template></div></div>
         <div v-if="detailTask.attachments?.length" class="modal-sec"><div class="modal-sec-title">Attachments ({{ detailTask.attachments.length }})</div>
@@ -1260,7 +1673,81 @@ const linkify = (text) => {
         </div>
         <div v-else-if="detailTask.discussionCount" class="modal-dim">{{ detailTask.discussionCount }} discussion messages (could not load).</div>
         <div v-if="detailError" class="worklog-msg err">Live fetch failed ({{ detailError }}) — showing row data.</div>
+        <div v-if="userLoginData.username === 'rajif' && !detailTask?.parentTaskID" class="modal-actions">
+          <button class="action-btn" @click="openCreateFor(detailTaskId)" title="Create a sub-task under this task (POST /api/v1/tasks with parentTaskID)">＋ Sub-task</button>
+        </div>
         <a :href="'https://taskmanager.minipc.sismedika.biz.id/tasks/' + detailTaskId" target="_blank" class="task-id">Open in TaskManager ↗</a>
+      </div>
+    </div>
+  </div>
+
+  <!-- create task modal: POST /api/v1/tasks as the logged-in actor -->
+  <div v-if="createOpen" class="modal-overlay" @click.self="createOpen = false">
+    <div class="modal-box">
+      <div class="modal-head">
+        <div class="modal-title-row">
+          <strong class="modal-title">New Task{{ createForm.parentTaskID ? ' — sub-task of ' + createForm.parentTaskID : '' }}</strong>
+          <button class="worklog-cancel" @click="createOpen = false">✕</button>
+        </div>
+      </div>
+      <div class="modal-body">
+        <div v-if="!actorUser" class="worklog-msg err">Login as actor first (👤 bar above) — the task is created under your account.</div>
+        <div class="create-grid">
+          <label class="create-label">Title *</label>
+          <input v-model="createForm.title" type="text" maxlength="200" placeholder="What needs to be done?" class="create-input" @keydown.enter="submitCreate" />
+          <label class="create-label">Product *</label>
+          <span class="pick-wrap">
+            <input v-model="createPick.product" type="text" class="create-input"
+                   placeholder="Type to search product…" @input="createForm.productCode = ''" />
+            <div v-if="createPick.product && !createForm.productCode && createProductHits.length" class="pick-popup">
+              <button v-for="p in createProductHits" :key="p.code" type="button" class="pick-option" @click="pickCreateProduct(p.code)">
+                <span class="mono">{{ p.code }}</span> — {{ p.name }}
+              </button>
+            </div>
+            <div v-else-if="createForm.productCode" class="pick-chosen">✓ {{ createForm.productCode }}</div>
+          </span>
+          <label class="create-label">Module *</label>
+          <span class="pick-wrap">
+            <input v-model="createPick.module" type="text" class="create-input"
+                   :disabled="!createForm.productCode"
+                   :placeholder="createForm.productCode ? 'Type to search module…' : 'Pick a product first'"
+                   @input="createForm.moduleCode = ''" />
+            <div v-if="createPick.module && !createForm.moduleCode && createModuleHits.length" class="pick-popup">
+              <button v-for="m in createModuleHits" :key="m.code" type="button" class="pick-option" @click="pickCreateModule(m.code)">
+                <span class="mono">{{ m.code }}</span> — {{ m.name }}
+              </button>
+            </div>
+            <div v-else-if="createForm.moduleCode" class="pick-chosen">✓ {{ createForm.moduleCode }}</div>
+          </span>
+          <label class="create-label">Priority</label>
+          <select v-model="createForm.priorityCode" class="create-input">
+            <option value="LOW">LOW</option>
+            <option value="NORMAL">NORMAL</option>
+            <option value="HIGH">HIGH</option>
+            <option value="URGENT">URGENT</option>
+          </select>
+          <label class="create-label">Severity</label>
+          <input v-model="createForm.severityCode" type="text" list="severity-options" placeholder="e.g. LOW / MEDIUM / HIGH" class="create-input" />
+          <datalist id="severity-options">
+            <option value="LOW"></option><option value="MEDIUM"></option><option value="HIGH"></option><option value="CRITICAL"></option>
+          </datalist>
+          <label class="create-label">Type</label>
+          <input v-model="createForm.typeCode" type="text" list="type-options" class="create-input" />
+          <datalist id="type-options">
+            <option value="TASK"></option><option value="BUG"></option><option value="FEATURE"></option><option value="ANALYSIS"></option>
+          </datalist>
+          <label class="create-label">Parent ID</label>
+          <input v-model="createForm.parentTaskID" type="text" placeholder="Optional — makes this a sub-task" class="create-input" />
+          <label class="create-label">Description</label>
+          <textarea v-model="createForm.description" rows="4" placeholder="Details, steps, links…" class="create-input create-textarea"></textarea>
+        </div>
+        <div v-if="createMsg" class="worklog-msg" :class="{ ok: createMsg.startsWith('✓'), err: !createMsg.startsWith('✓') }">{{ createMsg }}</div>
+        <div class="modal-actions">
+          <button class="action-btn" @click="submitCreate" :disabled="createBusy || !actorUser">
+            {{ createBusy ? 'Creating…' : 'Create Task' }}
+          </button>
+          <span class="modal-dim">POST /api/v1/tasks · 422 means a code was rejected — adjust Type/Severity/Priority</span>
+        </div>
       </div>
     </div>
   </div>
@@ -1539,6 +2026,10 @@ button {
 .logout-btn { background: #dc2626; }
 .export-btn { background: #16a34a; }
 .export-btn:hover { background: #15803d; }
+.create-btn { background: #7c3aed; }
+.create-btn:hover { background: #6d28d9; }
+.download-all-btn { background: #0d9488; }
+.download-all-btn:hover:not(:disabled) { background: #0f766e; }
 button:hover:not(:disabled) { background: #1d4ed8; }
 .logout-btn:hover { background: #b91c1c; }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
@@ -1663,6 +2154,24 @@ input {
   white-space: nowrap;
 }
 .modal-chip-blue { color: #1d4ed8; background: #dbeafe; border-color: #bfdbfe; }
+/* --- modal task actions --- */
+.modal-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.action-btn {
+  background: #2563eb; color: white; border: none; padding: 5px 12px;
+  border-radius: 4px; font-size: 0.78rem; font-weight: 600; cursor: pointer; white-space: nowrap;
+}
+.action-btn:hover:not(:disabled) { background: #1d4ed8; }
+.action-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.action-select {
+  padding: 5px 8px; border-radius: 4px; border: 1px solid #d1d5db;
+  font-size: 0.78rem; background: white; color: #374151; max-width: 180px;
+}
+.modal-note-row { display: flex; gap: 6px; }
+.modal-note-input {
+  flex: 1; padding: 5px 10px; border: 1px solid #d1d5db; border-radius: 4px;
+  font-size: 0.8rem; color: #1f2937;
+}
+.modal-note-input:focus { outline: none; border-color: #2563eb; box-shadow: 0 0 0 1px #2563eb; }
 .modal-sec-title { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: #9ca3af; margin-bottom: 4px; }
 .modal-text {
   white-space: pre-wrap;
@@ -1891,6 +2400,125 @@ input {
 }
 .worklog-msg.ok { color: #16a34a; background: #dcfce7; }
 .worklog-msg.err { color: #dc2626; background: #fee2e2; }
+
+/* --- quick row actions (take / dev-done) --- */
+.row-actions { display: inline-flex; gap: 4px; align-items: center; }
+.row-take-btn { color: #2563eb; border-color: #bfdbfe; }
+.row-take-btn:hover:not(:disabled) { background: #eff6ff; }
+.row-done-btn { color: #16a34a; border-color: #bbf7d0; }
+.row-done-btn:hover:not(:disabled) { background: #dcfce7; }
+
+/* --- sticky actions column (Work stays pinned on horizontal scroll) --- */
+.task-table th.actions-col,
+.task-table td.actions-col {
+  position: sticky;
+  right: 0;
+  z-index: 2;
+  background: white;
+  border-left: 1px solid #e5e7eb;
+  box-shadow: -6px 0 6px -6px rgba(0, 0, 0, 0.18);
+}
+.task-table th.actions-col { background: #f9fafb; z-index: 3; }
+.task-row:hover td.actions-col { background: #f3f4f6; }
+.task-row.deleted td.actions-col { background: white; }
+
+/* --- searchable pickers (create modal: product/module) --- */
+.pick-wrap { position: relative; display: block; }
+.pick-popup {
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 0; right: 0;
+  z-index: 10;
+  max-height: 220px;
+  overflow-y: auto;
+  background: white;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  text-align: left;
+}
+.pick-option {
+  display: block;
+  width: 100%;
+  background: white;
+  color: #374151;
+  border: none;
+  border-radius: 0;
+  padding: 6px 10px;
+  font-size: 0.8rem;
+  font-weight: 400;
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pick-popup .pick-option:hover { background: #eff6ff; color: #1d4ed8; }
+.pick-option .mono { font-family: monospace; font-weight: 600; }
+.pick-chosen {
+  margin-top: 3px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #16a34a;
+}
+
+/* --- searchable assign box (detail modal) --- */
+.assign-search-wrap { position: relative; display: inline-block; }
+.assign-search { width: 190px; max-width: none; background: white; color: #374151; }
+.assign-popup {
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 0;
+  z-index: 10;
+  min-width: 220px;
+  max-height: 240px;
+  overflow-y: auto;
+  background: white;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+.assign-option {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  background: white;
+  color: #374151;
+  border: none;
+  border-radius: 0;
+  padding: 6px 10px;
+  font-size: 0.8rem;
+  font-weight: 400;
+  text-align: left;
+  cursor: pointer;
+}
+.assign-popup .assign-option:hover { background: #eff6ff; color: #1d4ed8; }
+
+/* --- create task modal --- */
+.create-grid {
+  display: grid;
+  grid-template-columns: 90px 1fr;
+  gap: 8px 12px;
+  align-items: center;
+}
+.create-label {
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: #4b5563;
+  text-align: right;
+}
+.create-input {
+  padding: 6px 8px;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  color: #1f2937;
+  width: 100%;
+  box-sizing: border-box;
+}
+.create-input:focus { outline: none; border-color: #2563eb; box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15); }
+.create-textarea { resize: vertical; font-family: inherit; }
 
 /* --- user auth bar --- */
 .user-auth-bar {
