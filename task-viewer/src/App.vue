@@ -1628,8 +1628,9 @@ const linkify = (text) => {
           <span class="modal-dim">{{ fmtDate(detailTask.reportedAt) }} → {{ fmtDate(detailTask.qaDoneAt || detailTask.devDoneAt || detailTask.takenAt) || 'open' }}</span>
         </div>
         <div v-if="actorUser" class="modal-actions">
-          <button class="action-btn" @click="takeTask" :disabled="detailActionBusy" title="Claim task (POST /take)">⬇ Take</button>
-          <button class="action-btn" @click="devDoneTask" :disabled="detailActionBusy" title="Mark dev done (POST /dev-done)">✓ Dev Done</button>
+          <!-- !! coerces '' (idle) to false — Vue treats the empty string as a present boolean attribute -->
+          <button class="action-btn" @click="takeTask" :disabled="!!detailActionBusy" title="Claim task (POST /take)">⬇ Take</button>
+          <button class="action-btn" @click="devDoneTask" :disabled="!!detailActionBusy" title="Mark dev done (POST /dev-done)">✓ Dev Done</button>
           <template v-if="userLoginData.username === 'rajif'">
             <span class="assign-search-wrap">
               <input v-model="detailAssignQuery" @input="resolveAssignUser" type="text"
