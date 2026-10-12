@@ -984,7 +984,9 @@ const assignTask = async () => {
   try {
     const res = await fetch(`/api/v1/tasks/${encodeURIComponent(detailTaskId.value)}/assignments`, {
       method: 'POST', headers: actorHeaders(),
-      body: JSON.stringify({ actorUserID: actorUser.value.id, mode: 'reassign', targetUserID: detailAssignUser.value }),
+      // Server strict-decodes this body (DisallowUnknownFields): no actorUserID.
+      // The actor is derived from the bearer JWT, not the body.
+      body: JSON.stringify({ mode: 'reassign', targetUserID: detailAssignUser.value }),
     })
     if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`)
     detailActionMsg.value = '✓ Reassigned'
